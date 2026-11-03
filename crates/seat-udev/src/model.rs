@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DeviceKind {
+    /// Primary/KMS card node, never a render node or connector.
     Drm,
+    DrmRender,
     Evdev,
     Hidraw,
     Other,
@@ -16,6 +18,8 @@ pub struct SeatDevice {
     pub syspath: PathBuf,
     pub devnode: Option<PathBuf>,
     pub devnum: Option<u64>,
+    /// Filesystem/inode observed with this initialized udev generation.
+    pub node_identity: Option<(u64, u64)>,
     pub seat: SeatName,
     pub kind: DeviceKind,
     pub uaccess: bool,
@@ -185,6 +189,7 @@ mod tests {
             syspath: path.into(),
             devnode: Some(format!("/dev/{}", path.trim_start_matches('/')).into()),
             devnum: None,
+            node_identity: None,
             seat: SeatName::parse(seat).unwrap(),
             kind: DeviceKind::Drm,
             uaccess: false,

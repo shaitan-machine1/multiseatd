@@ -1,0 +1,11 @@
+[package]
+name = "with-seat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+lib-multiseatd.workspace = true
+libc.workspace = true

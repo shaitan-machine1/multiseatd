@@ -3,16 +3,15 @@ resolver = "2"
 members = [
   "crates/lib-multiseatd",
   "crates/multiseatd",
-  "crates/seat-launch",
+  "crates/with-seat",
   "crates/seat-udev",
-  "crates/seatd-server",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-only"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -23,10 +22,10 @@ lib-multiseatd = { path = "crates/lib-multiseatd" }
 nix = { version = "0.31", features = ["event", "fs", "ioctl", "poll", "process", "signal", "socket", "time", "uio", "user"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
 seat-udev = { path = "crates/seat-udev" }
-seatd-server = { path = "crates/seatd-server" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 udev = "0.9.3"
-uuid = { version = "1", features = ["v4", "v7"] }
+uuid = { version = "1", features = ["v4"] }

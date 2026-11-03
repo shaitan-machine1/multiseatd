@@ -22,12 +22,18 @@ unsafe extern "C" {
     fn acl_free(object: *mut c_void) -> c_int;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeIdentity {
     device: u64,
     inode: u64,
     number: u64,
     kind: u32,
+}
+
+impl NodeIdentity {
+    pub fn same_inode(self, expected: (u64, u64)) -> bool {
+        (self.device, self.inode) == expected
+    }
 }
 
 /// Retain the identity even if a write's outcome is uncertain. Otherwise a
@@ -84,6 +90,42 @@ impl Drop for AclObject {
     }
 }
 
+/// A pinned inode retained through queued writes, replacement and failed clear.
+/// Opening O_PATH does not open the underlying device for driver I/O.
+#[derive(Debug)]
+pub struct PinnedNode {
+    file: std::fs::File,
+    identity: NodeIdentity,
+}
+
+impl PinnedNode {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        let identity = NodeIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            number: metadata.rdev(),
+            kind: metadata.mode() & libc::S_IFMT,
+        };
+        Ok(Self { file, identity })
+    }
+
+    pub fn identity(&self) -> NodeIdentity {
+        self.identity
+    }
+
+    pub fn apply(&self, users: &BTreeSet<u32>) -> io::Result<()> {
+        apply_pinned_users(&self.file, self.identity, users).map(|_| ())
+    }
+}
+
 #[derive(Default)]
 pub struct LibAcl;
 
@@ -100,30 +142,17 @@ impl AclOps for LibAcl {
         users: &BTreeSet<u32>,
         expected: Option<NodeIdentity>,
     ) -> Result<Option<NodeIdentity>, ApplyFailure> {
-        // O_PATH pins the inode without opening a device for I/O (which can
-        // itself have driver side effects or fail EBUSY). libacl accesses the
-        // pinned inode through procfs, never re-resolving the original path.
-        let node = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        let metadata = node.metadata()?;
-        if metadata.file_type().is_symlink() {
-            return Err(io::Error::from_raw_os_error(libc::ELOOP).into());
-        }
-        let identity = NodeIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            number: metadata.rdev(),
-            kind: metadata.mode() & libc::S_IFMT,
-        };
+        let node = PinnedNode::open(path)?;
+        let identity = node.identity();
         if expected.is_some_and(|old| old != identity) {
             return Ok(None);
         }
-        apply_pinned_users(&node, identity, users).map_err(|error| ApplyFailure {
-            identity: Some(identity),
-            error,
-        })
+        node.apply(users)
+            .map(|()| Some(identity))
+            .map_err(|error| ApplyFailure {
+                identity: Some(identity),
+                error,
+            })
     }
 }
 

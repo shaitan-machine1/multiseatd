@@ -1,7 +1,14 @@
-pub mod access;
 pub mod acl;
-pub mod brokered;
+pub mod application;
+pub mod authority;
+pub mod daemon;
 pub mod dbus;
+pub mod device;
 pub mod instance;
-pub mod orchestrator;
+pub mod registry;
+pub mod resources;
+pub mod seat;
+pub mod seatd;
 pub mod topology;
+pub mod topology_transaction;
+pub mod vt;

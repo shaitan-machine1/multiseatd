@@ -48,10 +48,10 @@ impl Context {
         let mut enumerator = Enumerator::new().map_err(Error::Udev)?;
         enumerator.match_is_initialized().map_err(Error::Udev)?;
         for device in enumerator.scan_devices().map_err(Error::Udev)? {
-            if let Ok(device) = semantic_device(&device) {
-                if relevant(&device) {
-                    model.seed(device);
-                }
+            if let Ok(device) = semantic_device(&device)
+                && relevant(&device)
+            {
+                model.seed(device);
             }
         }
         let mut context = Self { model, monitor };
@@ -232,22 +232,63 @@ fn semantic_initialized_device(device: &Device) -> Result<SeatDevice, Error> {
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_default();
     let sysname = device.sysname().to_string_lossy();
-    let kind = match subsystem.as_str() {
-        "drm" => DeviceKind::Drm,
-        "input" if sysname.starts_with("event") => DeviceKind::Evdev,
-        "hidraw" => DeviceKind::Hidraw,
-        _ => DeviceKind::Other,
-    };
+    let kind = classify_device(&subsystem, &sysname);
+    let devnode = device
+        .devnode()
+        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+    let node_identity = devnode
+        .as_ref()
+        .and_then(|path| fs::metadata(path).ok())
+        .map(|metadata| (metadata.dev(), metadata.ino()));
     Ok(SeatDevice {
         syspath,
-        devnode: device
-            .devnode()
-            .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())),
+        devnode,
+        node_identity,
         devnum: device.devnum(),
         seat,
         kind,
         uaccess: has_tag(device, "uaccess"),
         master_of_seat: has_tag(device, "master-of-seat"),
+    })
+}
+
+fn classify_device(subsystem: &str, name: &str) -> DeviceKind {
+    match subsystem {
+        "drm" if numbered_node(name, "card") => DeviceKind::Drm,
+        "drm" if numbered_node(name, "renderD") => DeviceKind::DrmRender,
+        "input" if numbered_node(name, "event") => DeviceKind::Evdev,
+        "hidraw" if numbered_node(name, "hidraw") => DeviceKind::Hidraw,
+        _ => DeviceKind::Other,
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+    #[test]
+    fn only_primary_card_nodes_are_brokered_drm() {
+        assert_eq!(classify_device("drm", "card0"), DeviceKind::Drm);
+        assert_eq!(classify_device("drm", "renderD128"), DeviceKind::DrmRender);
+        assert_eq!(classify_device("drm", "card0-HDMI-A-1"), DeviceKind::Other);
+        assert_eq!(classify_device("drm", "controlD64"), DeviceKind::Other);
+        let render = SeatDevice {
+            syspath: "/sys/render".into(),
+            devnode: Some("/dev/dri/renderD128".into()),
+            devnum: None,
+            node_identity: None,
+            seat: SeatName::seat0(),
+            kind: DeviceKind::DrmRender,
+            uaccess: true,
+            master_of_seat: false,
+        };
+        assert!(!render.brokerable());
+        assert!(render.direct_access());
+    }
+}
+
+fn numbered_node(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
     })
 }
 
@@ -449,6 +490,7 @@ mod tests {
             syspath: "/sys/event0".into(),
             devnode: Some(fs::canonicalize(&brokered).unwrap()),
             devnum: Some(1),
+            node_identity: None,
             seat: SeatName::seat0(),
             kind: DeviceKind::Evdev,
             uaccess: true,
@@ -470,6 +512,7 @@ mod tests {
             syspath: "/sys/test-input".into(),
             devnode: Some("/dev/another-name".into()),
             devnum: Some(fs::metadata("/dev/null").unwrap().rdev()),
+            node_identity: None,
             seat: SeatName::seat0(),
             kind: DeviceKind::Evdev,
             uaccess: true,

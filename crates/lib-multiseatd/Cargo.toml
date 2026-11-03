@@ -10,3 +10,5 @@ name = "libmultiseatd"
 
 [dependencies]
 dbus.workspace = true
+libc.workspace = true
+uuid.workspace = true

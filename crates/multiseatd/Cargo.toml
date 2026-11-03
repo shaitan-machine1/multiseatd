@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-test-support = ["seatd-server/test-support"]
+test-support = []
 
 [dependencies]
 clap.workspace = true
@@ -14,13 +14,15 @@ hex.workspace = true
 dbus.workspace = true
 libc.workspace = true
 nix.workspace = true
+rustix.workspace = true
 uuid.workspace = true
 lib-multiseatd.workspace = true
 seat-udev.workspace = true
-seatd-server.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["io-util"] }
 tempfile = "3"
-seatd-server = { workspace = true, features = ["test-support"] }

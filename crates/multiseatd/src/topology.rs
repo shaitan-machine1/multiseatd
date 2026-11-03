@@ -1,7 +1,5 @@
-use crate::access::DirectNodes;
-use crate::brokered::authorization;
+use crate::device::{AllowedDevice, DeviceId, DeviceKind};
 use seat_udev::{Context, SeatDevice, SeatName};
-use seatd_server::AllowedDevice;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::fs::FileTypeExt;
@@ -11,7 +9,8 @@ use std::path::PathBuf;
 pub struct Snapshot {
     pub seats: BTreeSet<SeatName>,
     pub brokered: BTreeMap<SeatName, Vec<AllowedDevice>>,
-    pub direct: DirectNodes,
+    pub direct: BTreeMap<SeatName, BTreeSet<PathBuf>>,
+    pub identities: BTreeMap<PathBuf, (u64, u64)>,
 }
 
 impl Snapshot {
@@ -61,6 +60,29 @@ impl Snapshot {
             }
         }
         for device in devices {
+            if let Some(path) = &device.devnode {
+                use std::os::unix::fs::MetadataExt;
+                let Some(expected) = device.node_identity else {
+                    continue;
+                };
+                let metadata = match std::fs::metadata(path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                if expected != (metadata.dev(), metadata.ino())
+                    || device.devnum != Some(metadata.rdev())
+                    || (metadata.file_type().is_char_device() && console_number(metadata.rdev()))
+                {
+                    continue;
+                }
+                let path = match std::fs::canonicalize(path) {
+                    Ok(path) => path,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                snapshot.identities.insert(path, expected);
+            }
             if device.brokerable() && snapshot.seats.contains(&device.seat) {
                 match authorization(&device) {
                     Ok(Some(allowed)) => snapshot
@@ -97,7 +119,11 @@ impl Snapshot {
             use std::os::unix::fs::MetadataExt;
             let metadata = std::fs::metadata(&path)?;
             let kind = metadata.file_type();
+            snapshot
+                .identities
+                .insert(path.clone(), (metadata.dev(), metadata.ino()));
             if (kind.is_char_device() || kind.is_block_device())
+                && !(kind.is_char_device() && console_number(metadata.rdev()))
                 && !known_paths.contains(&path)
                 && !known_numbers.contains(&metadata.rdev())
             {
@@ -112,6 +138,34 @@ impl Snapshot {
     }
 }
 
+fn authorization(device: &SeatDevice) -> io::Result<Option<AllowedDevice>> {
+    use std::os::unix::ffi::OsStrExt;
+    let kind = match device.kind {
+        seat_udev::DeviceKind::Drm => DeviceKind::DrmPrimary,
+        seat_udev::DeviceKind::Evdev => DeviceKind::Evdev,
+        seat_udev::DeviceKind::Hidraw => DeviceKind::Hidraw,
+        _ => return Ok(None),
+    };
+    let Some(path) = &device.devnode else {
+        return Ok(None);
+    };
+    let number = device
+        .devnum
+        .ok_or_else(|| io::Error::other("brokered device has no device number"))?;
+    AllowedDevice::canonicalized(
+        DeviceId::new(hex::encode(device.syspath.as_os_str().as_bytes())),
+        path,
+        number,
+        kind,
+    )
+    .map(Some)
+}
+
+fn console_number(number: u64) -> bool {
+    (libc::major(number) == 4 && libc::minor(number) <= 63)
+        || (libc::major(number) == 5 && libc::minor(number) <= 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,11 +177,38 @@ mod tests {
             syspath: format!("/sys{path}").into(),
             devnode: Some(path.into()),
             devnum: Some(std::fs::metadata(path).unwrap().rdev()),
+            node_identity: Some((
+                std::fs::metadata(path).unwrap().dev(),
+                std::fs::metadata(path).unwrap().ino(),
+            )),
             seat: SeatName::parse(seat).unwrap(),
             kind,
             uaccess: true,
             master_of_seat: false,
         }
+    }
+
+    #[test]
+    fn stale_udev_inode_identity_cannot_authorize_a_replacement() {
+        let seat = SeatName::parse("seat-test").unwrap();
+        let mut old = device("/dev/null", DeviceKind::Evdev, seat.as_str());
+        let (filesystem, inode) = old.node_identity.unwrap();
+        old.node_identity = Some((filesystem, inode ^ 1));
+        let snapshot =
+            Snapshot::from_devices(BTreeSet::from([seat]), vec![old], Vec::new()).unwrap();
+        assert!(snapshot.brokered.is_empty());
+        assert!(snapshot.direct.is_empty());
+    }
+
+    #[test]
+    fn render_nodes_are_direct_not_brokered() {
+        let seat = SeatName::parse("seat-test").unwrap();
+        let render = device("/dev/null", DeviceKind::DrmRender, seat.as_str());
+        let snapshot =
+            Snapshot::from_devices(BTreeSet::from([seat.clone()]), vec![render], Vec::new())
+                .unwrap();
+        assert!(snapshot.brokered.is_empty());
+        assert!(snapshot.direct[&seat].contains(&PathBuf::from("/dev/null")));
     }
 
     #[test]

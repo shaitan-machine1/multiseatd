@@ -1,14 +1,47 @@
-//! Synchronous public D-Bus client and protocol types for multiseatd.
+//! Synchronous capability-based multiseatd v2 client. No executor or worker thread.
+pub mod contract;
+mod id;
+pub mod launch;
+pub use contract::{
+    BUS_NAME, ConnectionRow, ContextRow, ErrorKind, INTERFACE_NAME, INTROSPECTION, OBJECT_PATH,
+    SeatRow,
+};
+pub use id::{ConnectionId, ContextId, InvalidId};
+
 use dbus::blocking::{Connection, Proxy};
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::time::Duration;
 
-pub const BUS_NAME: &str = "org.decoupling.multiseatd1";
-pub const OBJECT_PATH: &str = "/org/decoupling/multiseatd1";
-pub const INTERFACE_NAME: &str = "org.decoupling.multiseatd1.Manager";
-pub type ClientRow = (String, String, u32, String);
-pub const INTROSPECTION: &str =
-    include_str!("../../../dist/dbus/org.decoupling.multiseatd1.Manager.xml");
+#[derive(Debug)]
+pub struct Context {
+    pub id: ContextId,
+    authority: OwnedFd,
+}
+impl AsFd for Context {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.authority.as_fd()
+    }
+}
+impl Context {
+    pub fn into_authority(self) -> OwnedFd {
+        self.authority
+    }
+}
+#[derive(Debug)]
+pub struct SeatConnection {
+    pub id: ConnectionId,
+    descriptor: OwnedFd,
+}
+impl AsFd for SeatConnection {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.descriptor.as_fd()
+    }
+}
+impl SeatConnection {
+    pub fn into_fd(self) -> OwnedFd {
+        self.descriptor
+    }
+}
 
 pub struct Client {
     connection: Connection,
@@ -27,55 +60,166 @@ impl Client {
             timeout,
         })
     }
-    fn proxy(&self) -> Proxy<'static, &Connection> {
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+    fn proxy(&self) -> Proxy<'_, &Connection> {
         self.connection
             .with_proxy(BUS_NAME, OBJECT_PATH, self.timeout)
     }
-    pub fn list_seats(&self) -> Result<Vec<String>, dbus::Error> {
-        let (seats,): (Vec<String>,) = self.proxy().method_call(INTERFACE_NAME, "ListSeats", ())?;
-        Ok(seats)
-    }
-    /// Create a seatd connection. The returned descriptor is owned by the caller.
-    pub fn create_client(&self, seat: &str, uid: u32) -> Result<(String, OwnedFd), dbus::Error> {
-        let (id, fd): (String, dbus::arg::OwnedFd) =
+    pub fn create_context(&self, seat: &str) -> Result<Context, dbus::Error> {
+        let (fd, id): (dbus::arg::OwnedFd, String) =
             self.proxy()
-                .method_call(INTERFACE_NAME, "CreateClient", (seat, uid))?;
-        // SAFETY: ownership is transferred out of the D-Bus descriptor exactly once.
-        let received = unsafe { OwnedFd::from_raw_fd(fd.into_raw_fd()) };
-        // libdbus may duplicate descriptors without CLOEXEC. Return a separate
-        // close-on-exec duplicate so the lease cannot leak into child processes.
-        let fd = received
-            .try_clone()
-            .map_err(|error| dbus::Error::new_failed(&format!("duplicate seatd fd: {error}")))?;
-        Ok((id, fd))
+                .method_call(INTERFACE_NAME, "CreateContext", (seat,))?;
+        Ok(Context {
+            id: parse(&id)?,
+            authority: received(fd)?,
+        })
     }
-
-    /// Revoke a client; revoking an already-removed client is successful.
-    pub fn revoke_client(&self, client_id: &str) -> Result<(), dbus::Error> {
+    pub fn activate_context(&self, authority: BorrowedFd<'_>) -> Result<(), dbus::Error> {
+        self.authority_call("ActivateContext", authority)
+    }
+    pub fn deactivate_context(&self, authority: BorrowedFd<'_>) -> Result<(), dbus::Error> {
+        self.authority_call("DeactivateContext", authority)
+    }
+    pub fn remove_context(&self, authority: BorrowedFd<'_>) -> Result<(), dbus::Error> {
+        self.authority_call("RemoveContext", authority)
+    }
+    fn authority_call(&self, method: &str, authority: BorrowedFd<'_>) -> Result<(), dbus::Error> {
         self.proxy()
-            .method_call(INTERFACE_NAME, "RevokeClient", (client_id,))
+            .method_call(INTERFACE_NAME, method, (argument(authority)?,))
     }
-
-    pub fn list_clients(&self) -> Result<Vec<ClientRow>, dbus::Error> {
-        let (clients,): (Vec<ClientRow>,) =
+    pub fn grant_access(&self, authority: BorrowedFd<'_>, uid: u32) -> Result<(), dbus::Error> {
+        self.proxy()
+            .method_call(INTERFACE_NAME, "GrantAccess", (argument(authority)?, uid))
+    }
+    pub fn revoke_access(&self, authority: BorrowedFd<'_>, uid: u32) -> Result<(), dbus::Error> {
+        self.proxy()
+            .method_call(INTERFACE_NAME, "RevokeAccess", (argument(authority)?, uid))
+    }
+    pub fn create_connection(
+        &self,
+        authority: BorrowedFd<'_>,
+    ) -> Result<SeatConnection, dbus::Error> {
+        let (fd, id): (dbus::arg::OwnedFd, String) = self.proxy().method_call(
+            INTERFACE_NAME,
+            "CreateConnection",
+            (argument(authority)?,),
+        )?;
+        Ok(SeatConnection {
+            id: parse(&id)?,
+            descriptor: received(fd)?,
+        })
+    }
+    pub fn remove_connection(
+        &self,
+        authority: BorrowedFd<'_>,
+        id: ConnectionId,
+    ) -> Result<(), dbus::Error> {
+        self.proxy().method_call(
+            INTERFACE_NAME,
+            "RemoveConnection",
+            (argument(authority)?, id.to_string()),
+        )
+    }
+    /// Only this context's seat name/VT metadata, never another context's IDs.
+    pub fn seat_metadata(&self, authority: BorrowedFd<'_>) -> Result<(String, u32), dbus::Error> {
+        self.proxy()
+            .method_call(INTERFACE_NAME, "GetSeatMetadata", (argument(authority)?,))
+    }
+    pub fn get_context(&self, authority: BorrowedFd<'_>) -> Result<ContextRow, dbus::Error> {
+        let (row,): (ContextRow,) =
             self.proxy()
-                .method_call(INTERFACE_NAME, "ListClients", ())?;
-        Ok(clients)
+                .method_call(INTERFACE_NAME, "GetContext", (argument(authority)?,))?;
+        Ok(row)
+    }
+    pub fn activate_context_by_id(&self, id: ContextId) -> Result<(), dbus::Error> {
+        self.id_call("ActivateContextById", &id.to_string())
+    }
+    pub fn deactivate_context_by_id(&self, id: ContextId) -> Result<(), dbus::Error> {
+        self.id_call("DeactivateContextById", &id.to_string())
+    }
+    pub fn remove_context_by_id(&self, id: ContextId) -> Result<(), dbus::Error> {
+        self.id_call("RemoveContextById", &id.to_string())
+    }
+    pub fn remove_connection_by_id(&self, id: ConnectionId) -> Result<(), dbus::Error> {
+        self.id_call("RemoveConnectionById", &id.to_string())
+    }
+    fn id_call(&self, method: &str, id: &str) -> Result<(), dbus::Error> {
+        self.proxy().method_call(INTERFACE_NAME, method, (id,))
+    }
+    pub fn list_seats(&self) -> Result<Vec<SeatRow>, dbus::Error> {
+        let (rows,): (Vec<SeatRow>,) = self.proxy().method_call(INTERFACE_NAME, "ListSeats", ())?;
+        Ok(rows)
+    }
+    pub fn list_contexts(&self) -> Result<Vec<ContextRow>, dbus::Error> {
+        let (rows,): (Vec<ContextRow>,) =
+            self.proxy()
+                .method_call(INTERFACE_NAME, "ListContexts", ())?;
+        Ok(rows)
+    }
+    pub fn list_connections(&self) -> Result<Vec<ConnectionRow>, dbus::Error> {
+        let (rows,): (Vec<ConnectionRow>,) =
+            self.proxy()
+                .method_call(INTERFACE_NAME, "ListConnections", ())?;
+        Ok(rows)
+    }
+    pub fn owner(&self) -> Result<String, dbus::Error> {
+        let (owner,): (String,) = self
+            .connection
+            .with_proxy(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                self.timeout,
+            )
+            .method_call("org.freedesktop.DBus", "GetNameOwner", (BUS_NAME,))?;
+        Ok(owner)
+    }
+    /// Install before querying inventory. Drive callbacks explicitly with process;
+    /// restart invalidates this owner-specific subscription and all old handles.
+    pub fn subscribe(
+        &self,
+        mut callback: impl FnMut(u64) + Send + 'static,
+    ) -> Result<dbus::channel::Token, dbus::Error> {
+        let owner = self.owner()?;
+        let rule = dbus::message::MatchRule::new_signal(INTERFACE_NAME, "StateChanged")
+            .with_path(OBJECT_PATH)
+            .with_sender(owner);
+        let token = self
+            .connection
+            .add_match(rule, move |(revision,): (u64,), _, _| {
+                callback(revision);
+                true
+            })?;
+        // Authenticate/register this unique root peer for private signal delivery.
+        if let Err(error) = self.list_seats() {
+            let _ = self.connection.remove_match(token);
+            return Err(error);
+        }
+        Ok(token)
+    }
+    pub fn process(&self, timeout: Duration) -> Result<bool, dbus::Error> {
+        self.connection.process(timeout)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn protocol_names_are_stable() {
-        assert_eq!(BUS_NAME, "org.decoupling.multiseatd1");
-        assert_eq!(OBJECT_PATH, "/org/decoupling/multiseatd1");
-        assert_eq!(INTERFACE_NAME, "org.decoupling.multiseatd1.Manager");
-        use dbus::arg::Arg;
-        assert_eq!(<Vec<ClientRow>>::signature().to_string(), "a(ssus)");
-        assert_eq!(dbus::arg::OwnedFd::signature().to_string(), "h");
-        assert!(INTROSPECTION.contains("CreateClient"));
-        assert!(!INTROSPECTION.contains("Refresh"));
+fn parse<T: std::str::FromStr<Err = InvalidId>>(text: &str) -> Result<T, dbus::Error> {
+    text.parse()
+        .map_err(|error| dbus::Error::new_failed(&format!("invalid daemon ID: {error}")))
+}
+fn argument(fd: BorrowedFd<'_>) -> Result<dbus::arg::OwnedFd, dbus::Error> {
+    let duplicate = duplicate(fd).map_err(|error| dbus::Error::new_failed(&error.to_string()))?;
+    Ok(unsafe { dbus::arg::OwnedFd::from_raw_fd(duplicate.into_raw_fd()) })
+}
+fn duplicate(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
+    use std::os::fd::AsRawFd;
+    let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if raw < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
     }
+}
+fn received(fd: dbus::arg::OwnedFd) -> Result<OwnedFd, dbus::Error> {
+    let received = unsafe { OwnedFd::from_raw_fd(fd.into_raw_fd()) };
+    duplicate(received.as_fd()).map_err(|error| dbus::Error::new_failed(&error.to_string()))
 }

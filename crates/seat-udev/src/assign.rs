@@ -347,10 +347,10 @@ impl AssignmentBackend for RealAssignmentBackend {
 fn resolve_group(path: &Path) -> Result<AssignmentGroup, AssignmentError> {
     let mut device = device_from_path(path)?;
     loop {
-        if has_tag(&device, "seat") {
-            if let Some(id) = property(&device, "ID_FOR_SEAT") {
-                return group_from_ancestor(device, id);
-            }
+        if has_tag(&device, "seat")
+            && let Some(id) = property(&device, "ID_FOR_SEAT")
+        {
+            return group_from_ancestor(device, id);
         }
         let Some(parent) = device.parent() else {
             return Err(AssignmentError::NotAssignable(path.into()));
