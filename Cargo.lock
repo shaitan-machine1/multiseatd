@@ -163,6 +163,7 @@ dependencies = [
  "rustix",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

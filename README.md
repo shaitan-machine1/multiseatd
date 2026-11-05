@@ -76,4 +76,5 @@ There is no implicit checkout-layout dependency.
 `test-support` only enables explicit synthetic fixtures; /dev/null is not evidence
 of real driver revocation. Fake VT and exec fixtures are not authenticated graphical
 login or physical-hardware acceptance. The session/client libraries and wrapper
-remain synchronous and executor-free; Tokio is confined to the daemon.
+remain synchronous and executor-free. Tokio is server-only: the daemon drives
+its broker transport futures on its own runtime; no library constructs one.
