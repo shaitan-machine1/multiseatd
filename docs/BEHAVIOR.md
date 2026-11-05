@@ -50,6 +50,15 @@ VT operations/signals stay on one native task. It retains ownership across a
 caught failure until outer device/ACL cleanup; normal restoration and actual joins
 are explicit. Final failure cleanup is best effort, never certified as success.
 
+## Per-seat startup boundary (next interface)
+
+Finish device assignments before starting the destination seat instance.
+Startup enumeration establishes its initial inventory; it is not a live move
+and must not infer previous ownership, query other seats or wait for handover.
+Moving devices to a seat concurrently with starting that seat is unsupported.
+Only observed live moves use the old/new assignment and cross-seat wait policy.
+This describes the upcoming per-seat interface, not the current v2 global daemon.
+
 ## Regression migration
 
 Correct framing, malformed/fragmented traffic, ancillary truncation/ownership and
