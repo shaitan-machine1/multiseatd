@@ -8,7 +8,7 @@ if (( EUID != 0 )); then
     done
     sudo -n true || exit 77
     cargo build --manifest-path "$repo/Cargo.toml" -p multiseatd --features test-support --bin multiseatd --example context-probe
-    cargo build --manifest-path "$repo/Cargo.toml" -p with-seat
+    cargo build --manifest-path "$repo/Cargo.toml" -p seat-launch
     exec sudo -n env CONTEXT_LIBSEAT_CLIENT="${CONTEXT_LIBSEAT_CLIENT:-}" timeout --signal=TERM --kill-after=5s 60s bash "$0" --root
 fi
 work=$(mktemp -d /tmp/multiseat-context.XXXXXX)
@@ -25,8 +25,8 @@ cleanup() {
 trap cleanup EXIT
 cp "$repo/target/debug/multiseatd" "$work/multiseatd"
 cp "$repo/target/debug/examples/context-probe" "$work/probe"
-cp "$repo/target/debug/with-seat" "$work/with-seat"
-chmod 755 "$work/multiseatd" "$work/probe" "$work/with-seat"
+cp "$repo/target/debug/seat-launch" "$work/seat-launch"
+chmod 755 "$work/multiseatd" "$work/probe" "$work/seat-launch"
 printf '%s\n' '<busconfig>' '<type>system</type>' "<listen>unix:path=$work/bus</listen>" '<auth>EXTERNAL</auth>' '<policy context="default"><allow user="*"/><allow send_destination="*"/><allow receive_sender="*"/></policy>' '<policy user="root"><allow own="*"/></policy>' "<include>$repo/dist/dbus/org.decoupling.multiseatd2.conf</include>" '</busconfig>' >"$work/bus.conf"
 dbus-daemon --nofork --config-file="$work/bus.conf" >"$work/bus.log" 2>&1 &
 bus=$!
@@ -58,7 +58,7 @@ if [[ -n ${CONTEXT_LIBSEAT_CLIENT:-} ]]; then
     cp "$CONTEXT_LIBSEAT_CLIENT" "$work/libseat-client"
     chmod 755 "$work/libseat-client"
     timeout 15 "$work/probe" libseat "$work/libseat-client" "$(id -u nobody)" "$(id -g nobody)"
-    timeout 15 "$work/probe" wrapper "$work/with-seat" "$work/libseat-client" "$(id -u nobody)" "$(id -g nobody)"
+    timeout 15 "$work/probe" wrapper "$work/seat-launch" "$work/libseat-client" "$(id -u nobody)" "$(id -g nobody)"
 fi
 "$work/probe" delegate "$work/delegation" "$(id -u nobody)" >"$work/delegate.log" 2>&1 &
 delegator=$!

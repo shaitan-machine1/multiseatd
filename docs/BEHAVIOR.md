@@ -16,7 +16,7 @@ https://github.com/shaitan-machine1/seatd.git at
 * Seat0 has one explicitly configured, seat-owned graphical VT. Context opens
   do not sample/bind the foreground VT. Non-VT seats allocate no terminals.
 * Managed graphical lineages receive no Linux controlling terminal or VT FD.
-  Trusted launch workers detach/sanitize standard streams; with-seat closes full
+  Trusted launch workers detach/sanitize standard streams; seat-launch closes full
   authority and unlisted descriptors before compositor exec. PTYs are allowed.
 * Protocol switching requires an enabled, unfenced effective connection. Switch
   acceptance does not prove acquisition. External/kernel switches remain possible.

@@ -20,7 +20,7 @@ struct Args {
 }
 fn main() {
     if let Err(error) = run(Args::parse()) {
-        eprintln!("with-seat: {error}");
+        eprintln!("seat-launch: {error}");
         std::process::exit(1);
     }
 }
@@ -61,7 +61,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     drop(client);
     drop(authority);
     if std::fs::read_dir("/proc/self/task")?.count() != 1 {
-        return Err("with-seat requires a single-threaded exec worker".into());
+        return Err("seat-launch requires a single-threaded exec worker".into());
     }
     use std::os::fd::AsRawFd;
     let raw = descriptor.as_raw_fd();

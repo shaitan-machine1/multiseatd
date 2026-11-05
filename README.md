@@ -1,8 +1,8 @@
-# multiseat
+# multiseatd
 
 Capability-authorized seat contexts, independent C libseat/seatd connections and
 explicit UID access grants. Installable pieces are `multiseatd`, `seat-udev`,
-`lib-multiseatd` (Rust library `libmultiseatd`) and the `with-seat` exec wrapper.
+`lib-multiseatd` (Rust library `libmultiseatd`) and the `seat-launch` exec wrapper.
 
 The incompatible v2 API replaces the former client-lease interface. No old bus
 name, compatibility adapter, separate server crate or seat-launch remains.
@@ -32,7 +32,7 @@ Trusted graphical launch code drops credentials/PAM and detaches/sanitizes its
 lineage. At the final compositor exec boundary it delegates authority explicitly:
 
 ```sh
-MULTISEATD_AUTHORITY_FD=3 /usr/libexec/multiseatd/with-seat /usr/bin/weston
+MULTISEATD_AUTHORITY_FD=3 /usr/libexec/multiseatd/seat-launch /usr/bin/weston
 ```
 
 FD 3 must really be inherited from an authorized controller; the number/environment

@@ -3,7 +3,7 @@ resolver = "2"
 members = [
   "crates/lib-multiseatd",
   "crates/multiseatd",
-  "crates/with-seat",
+  "crates/seat-launch",
   "crates/seat-udev",
 ]
 

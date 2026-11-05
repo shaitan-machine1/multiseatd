@@ -91,7 +91,7 @@ let connection = client.create_connection(context.as_fd())?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-A trusted, already credential-dropped/detached worker execs with-seat using an
+A trusted, already credential-dropped/detached worker execs seat-launch using an
 explicit inherited `MULTISEATD_AUTHORITY_FD` (or `--authority-fd`). Safe standard
 streams/PTYs are permitted; Linux VT/control-terminal inheritance is rejected.
 Only the new seatd FD survives ordinary-app exec. Exec failure closes that connection,
