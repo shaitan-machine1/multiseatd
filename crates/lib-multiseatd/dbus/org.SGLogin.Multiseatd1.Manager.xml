@@ -1,0 +1,65 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- Per-seat target contract. Runtime migration from the global v2 interface
+     is in progress; this file does not add a compatibility adapter. -->
+<node name="/org/SGLogin/Multiseatd1">
+  <interface name="org.SGLogin.Multiseatd1.Manager">
+    <method name="CreateContext">
+      <arg name="authority" type="h" direction="out"/>
+      <arg name="context_id" type="s" direction="out"/>
+    </method>
+    <method name="ActivateContext">
+      <arg name="authority" type="h" direction="in"/>
+    </method>
+    <method name="DeactivateContext">
+      <arg name="authority" type="h" direction="in"/>
+    </method>
+    <method name="RemoveContext">
+      <arg name="authority" type="h" direction="in"/>
+    </method>
+    <method name="GrantACL">
+      <arg name="authority" type="h" direction="in"/>
+      <arg name="uid" type="u" direction="in"/>
+    </method>
+    <method name="RevokeACL">
+      <arg name="authority" type="h" direction="in"/>
+      <arg name="uid" type="u" direction="in"/>
+    </method>
+    <method name="CreateConnection">
+      <arg name="authority" type="h" direction="in"/>
+      <arg name="connection" type="h" direction="out"/>
+      <arg name="handle" type="u" direction="out"/>
+    </method>
+    <method name="GetContext">
+      <arg name="authority" type="h" direction="in"/>
+      <!-- id, desired_uids, connection_handles, selected, effective, phase,
+           pending, cleanup_pending, diagnostics -->
+      <arg name="context" type="(sauaubbsbbas)" direction="out"/>
+    </method>
+    <method name="GetSeatMetadata">
+      <arg name="authority" type="h" direction="in"/>
+      <arg name="seat" type="s" direction="out"/>
+      <arg name="vt" type="u" direction="out"/>
+    </method>
+    <method name="ActivateContextById">
+      <arg name="context_id" type="s" direction="in"/>
+    </method>
+    <method name="DeactivateContextById">
+      <arg name="context_id" type="s" direction="in"/>
+    </method>
+    <method name="RemoveContextById">
+      <arg name="context_id" type="s" direction="in"/>
+    </method>
+    <method name="ListContexts">
+      <arg name="contexts" type="a(sauaubbsbbas)" direction="out"/>
+    </method>
+    <method name="WaitUntilDeviceDisowned">
+      <!-- Observational wait for this sysfs path, including retained cleanup.
+           Not used for startup enumeration; finish assignments before start. -->
+      <arg name="syspath" type="s" direction="in"/>
+    </method>
+    <signal name="StateChanged">
+      <arg name="revision" type="t"/>
+    </signal>
+  </interface>
+</node>

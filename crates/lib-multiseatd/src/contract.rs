@@ -57,6 +57,63 @@ mod tests {
     use dbus::arg::Arg;
 
     #[test]
+    fn per_seat_target_contract_has_only_context_information() {
+        // Freeze the target before switching the daemon/client together. The
+        // currently running global v2 implementation still uses INTROSPECTION.
+        let target = include_str!("../dbus/org.SGLogin.Multiseatd1.Manager.xml");
+        type ContextWire = (
+            String,
+            Vec<u32>,
+            Vec<u32>,
+            bool,
+            bool,
+            String,
+            bool,
+            bool,
+            Vec<String>,
+        );
+        assert_eq!(ContextWire::signature().to_string(), "(sauaubbsbbas)");
+        assert_eq!(
+            Vec::<ContextWire>::signature().to_string(),
+            "a(sauaubbsbbas)"
+        );
+        assert!(target.contains("org.SGLogin.Multiseatd1.Manager"));
+        let methods = [
+            "CreateContext",
+            "ActivateContext",
+            "DeactivateContext",
+            "RemoveContext",
+            "GrantACL",
+            "RevokeACL",
+            "CreateConnection",
+            "GetContext",
+            "GetSeatMetadata",
+            "ActivateContextById",
+            "DeactivateContextById",
+            "RemoveContextById",
+            "ListContexts",
+            "WaitUntilDeviceDisowned",
+        ];
+        assert_eq!(target.matches("<method name=").count(), methods.len());
+        for method in methods {
+            assert!(target.contains(&format!("<method name=\"{method}\">")));
+        }
+        for removed in [
+            "RemoveConnection",
+            "ListConnections",
+            "GetSeatState",
+            "ListSeats",
+            "GrantAccess",
+            "RevokeAccess",
+        ] {
+            assert!(!target.contains(&format!("<method name=\"{removed}\"")));
+        }
+        assert!(target.contains("name=\"syspath\" type=\"s\" direction=\"in\""));
+        assert!(target.contains("name=\"handle\" type=\"u\" direction=\"out\""));
+        assert_eq!(target.matches("<signal name=").count(), 1);
+    }
+
+    #[test]
     fn context_contract_has_exact_status_and_descriptor_signatures() {
         for (actual, expected) in [
             (Vec::<SeatRow>::signature().to_string(), "a(subssss)"),
