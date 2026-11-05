@@ -3,7 +3,8 @@ fn monitor_first_context_respects_real_device_initialization() {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
-    let context = seat_udev::Context::new().expect("open libudev context");
+    let mut context = seat_udev::Context::new().expect("open libudev context");
+    context.rescan().expect("read-only live re-enumeration");
     let path = Path::new("/dev/null");
     let metadata = std::fs::metadata(path).expect("inspect /dev/null");
     let device = udev::Device::from_devnum(udev::DeviceType::Character, metadata.rdev())

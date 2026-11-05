@@ -45,14 +45,8 @@ impl Context {
             .and_then(MonitorBuilder::listen)
             .map_err(Error::Udev)?;
         let mut model = Model::default();
-        let mut enumerator = Enumerator::new().map_err(Error::Udev)?;
-        enumerator.match_is_initialized().map_err(Error::Udev)?;
-        for device in enumerator.scan_devices().map_err(Error::Udev)? {
-            if let Ok(device) = semantic_device(&device)
-                && relevant(&device)
-            {
-                model.seed(device);
-            }
+        for device in enumerate_devices()? {
+            model.seed(device);
         }
         let mut context = Self { model, monitor };
         // Reconcile events queued during enumeration before exposing the initial
@@ -92,6 +86,19 @@ impl Context {
             EventType::Unknown => Vec::new(),
         };
         Ok(Some(events))
+    }
+
+    /// Read fresh libudev state rather than treating the monitor cache as a
+    /// lossless journal. The daemon chooses its thread/schedule; no worker or
+    /// executor is created here. A bounded monitor batch repairs scan races;
+    /// any remaining queued events stay readable for ordinary receive calls.
+    pub fn rescan(&mut self) -> Result<Vec<Event>, Error> {
+        let mut events = self.model.reconcile(enumerate_devices()?);
+        for _ in 0..64 {
+            let Some(queued) = self.receive()? else { break };
+            events.extend(queued);
+        }
+        Ok(events)
     }
 
     pub fn seats(&self) -> Vec<SeatName> {
@@ -165,6 +172,20 @@ impl Context {
             .map_err(|_| Error::NotFound(path.into()))?;
         semantic_device(&device)
     }
+}
+
+fn enumerate_devices() -> Result<Vec<SeatDevice>, Error> {
+    let mut enumerator = Enumerator::new().map_err(Error::Udev)?;
+    enumerator.match_is_initialized().map_err(Error::Udev)?;
+    let mut devices = Vec::new();
+    for device in enumerator.scan_devices().map_err(Error::Udev)? {
+        if let Ok(device) = semantic_device(&device)
+            && relevant(&device)
+        {
+            devices.push(device);
+        }
+    }
+    Ok(devices)
 }
 
 fn discover_static_direct_access_nodes(

@@ -117,6 +117,29 @@ impl Model {
         events
     }
 
+    /// Reconcile a fresh enumeration after monitor loss or a periodic audit.
+    /// Initial startup uses seed instead: an initial inventory is not a move.
+    pub fn reconcile(&mut self, devices: impl IntoIterator<Item = SeatDevice>) -> Vec<Event> {
+        let next: BTreeMap<_, _> = devices
+            .into_iter()
+            .map(|device| (device.syspath.clone(), device))
+            .collect();
+        let removed: Vec<_> = self
+            .devices
+            .keys()
+            .filter(|path| !next.contains_key(*path))
+            .cloned()
+            .collect();
+        let mut events = Vec::new();
+        for path in removed {
+            events.extend(self.remove(&path));
+        }
+        for device in next.into_values() {
+            events.extend(self.add_or_change(device));
+        }
+        events
+    }
+
     pub fn seats(&self) -> BTreeSet<SeatName> {
         self.devices
             .values()
@@ -342,6 +365,52 @@ mod tests {
             model.direct_access_devices(&SeatName::seat0()),
             vec![direct]
         );
+    }
+
+    #[test]
+    fn only_seat_udev_selects_broker_families_and_tagged_direct_nodes() {
+        let mut node = device("/node", "seat0", false);
+        for kind in [DeviceKind::Drm, DeviceKind::Evdev, DeviceKind::Hidraw] {
+            node.kind = kind;
+            for tag in [false, true] {
+                node.uaccess = tag;
+                assert!(node.brokerable());
+                assert!(!node.direct_access());
+            }
+        }
+        for kind in [DeviceKind::DrmRender, DeviceKind::Other] {
+            node.kind = kind;
+            node.uaccess = false;
+            assert!(!node.brokerable() && !node.direct_access());
+            node.uaccess = true;
+            assert!(!node.brokerable() && node.direct_access());
+        }
+        node.devnode = None;
+        assert!(!node.brokerable() && !node.direct_access());
+    }
+
+    #[test]
+    fn reenumeration_repairs_lost_moves_removals_and_tag_changes() {
+        let mut model = Model::default();
+        let old = device("/gpu", "seat0", true);
+        let removed = device("/gone", "seat0", false);
+        let mut tagged = device("/audio", "seat0", false);
+        tagged.kind = DeviceKind::Other;
+        tagged.uaccess = true;
+        model.seed(old.clone());
+        model.seed(removed.clone());
+        model.seed(tagged.clone());
+        let mut moved = old.clone();
+        moved.seat = SeatName::parse("seat1").unwrap();
+        tagged.uaccess = false;
+        let added = device("/new", "seat1", false);
+        let snapshot = vec![moved.clone(), tagged.clone(), added.clone()];
+        let events = model.reconcile(snapshot.clone());
+        assert!(events.contains(&Event::DeviceMoved { old, new: moved }));
+        assert!(events.contains(&Event::DeviceRemoved(removed)));
+        assert!(events.contains(&Event::DeviceAdded(added)));
+        assert!(model.direct_access_devices(&SeatName::seat0()).is_empty());
+        assert!(model.reconcile(snapshot).is_empty());
     }
 
     #[test]
