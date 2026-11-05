@@ -59,6 +59,11 @@ impl Controller {
             let _ = done.send(());
             return;
         }
+        let Some((device, permit)) = self.inventory.authorize(&path, &permit) else {
+            self.send(id, wire::error(libc::EACCES), None);
+            let _ = done.send(());
+            return;
+        };
         let Ok(worker) = self.budget.workers.clone().try_acquire_owned() else {
             self.send(id, wire::error(libc::EAGAIN), None);
             let _ = done.send(());
@@ -77,18 +82,12 @@ impl Controller {
             .filter(|(_, slot)| !slot.retired && !slot.closed)
             .map(|(number, slot)| (*number, slot.device.clone(), slot.handle))
             .collect();
-        let devices = self.policy.devices.clone();
         let resources = self.resources.clone();
         let synthetic = self.policy.synthetic;
         self.clients.get_mut(&id).expect("client").operations += 1;
         self.device_jobs.spawn(async move {
             let operation = tokio::task::spawn_blocking(move || {
                 let _worker = worker;
-                // Requests name a published canonical node, never an arbitrary
-                // caller-controlled filesystem walk (including FUSE/autofs).
-                let Some(device) = devices.get(&path).cloned() else {
-                    return Operation::Denied(libc::EACCES);
-                };
                 if !permit.is_open() {
                     return Operation::Denied(libc::EACCES);
                 }

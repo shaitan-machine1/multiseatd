@@ -18,8 +18,10 @@ pub struct Policy {
 }
 
 impl Controller {
-    pub fn set_initial_policy(&mut self, policy: Policy) {
+    pub fn set_initial_policy(&mut self, mut policy: Policy) {
         assert!(self.contexts.is_empty());
+        let devices = std::mem::take(&mut policy.devices);
+        self.inventory.replace(devices.values().cloned());
         self.policy = policy;
     }
 
@@ -58,7 +60,9 @@ impl Controller {
         if !self.policy_replies.is_empty() {
             return;
         }
-        if let Some(policy) = self.policy_pending.take() {
+        if let Some(mut policy) = self.policy_pending.take() {
+            let devices = std::mem::take(&mut policy.devices);
+            self.inventory.replace(devices.values().cloned());
             self.policy = policy;
             self.policy_gate.send_replace(Permit::new());
             self.topology_paused = false;
