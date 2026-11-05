@@ -28,7 +28,9 @@ impl Controller {
         })
     }
     pub(super) fn epoch(&self, context: ContextId) -> Permit {
-        let mut epoch = Permit::for_context(self.contexts[&context].lifetime.clone())
+        let mut epoch = self.contexts[&context]
+            .lifetime
+            .permit()
             .gated(self.policy_gate.borrow().gate());
         if let Some(facts) = &self.vt_facts {
             epoch = epoch.gated(facts.borrow().gate.gate());
@@ -108,7 +110,7 @@ impl Controller {
         if let Some(port) = &self.vt {
             // Full authority may acquire from background; the access epoch's
             // closed foreground gate is deliberately NOT an acquisition right.
-            let permit = Permit::for_context(self.contexts[&context].lifetime.clone());
+            let permit = self.contexts[&context].lifetime.permit();
             match port.acquire(permit) {
                 Ok(()) => self.vt_requested = true,
                 Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => {}

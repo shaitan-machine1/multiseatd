@@ -11,8 +11,9 @@ See [API](docs/API.md) and [behavior/security limits](docs/BEHAVIOR.md).
 
 The per-seat rewrite is in progress: the CLI/API below still describe the global
 v2 implementation. The five-crate workspace now includes context-unaware
-`dev-broker` kernel/framing/descriptor primitives; connection/inventory ownership
-and the per-seat control-plane migration are not yet complete.
+`dev-broker` kernel/framing/descriptor primitives and retained broker resource
+ownership, separate from daemon-owned ACLs. Connection/inventory ownership and
+the per-seat control-plane migration are not yet complete.
 
 ## Operation
 

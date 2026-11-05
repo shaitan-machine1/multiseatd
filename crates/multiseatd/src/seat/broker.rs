@@ -44,6 +44,7 @@ impl Controller {
         done: oneshot::Sender<()>,
     ) {
         let client = &self.clients[&id];
+        let owner = client.resource_owner;
         let context = client.context;
         let Some(permit) = client.epoch.clone().filter(|epoch| epoch.is_open()) else {
             self.send(id, wire::error(libc::EACCES), None);
@@ -98,7 +99,7 @@ impl Controller {
                     if !available || next == i32::MAX {
                         return Operation::Denied(libc::EMFILE);
                     }
-                    let handle = reserve(&resources, id, device.clone(), synthetic);
+                    let handle = reserve(&resources, owner, device.clone(), synthetic);
                     match handle {
                         Ok(handle) => (next, handle, true),
                         Err(error) => return Operation::Denied(errno(&error)),
@@ -368,7 +369,7 @@ fn errno(error: &io::Error) -> i32 {
 }
 fn reserve(
     resources: &Resources,
-    owner: ConnectionId,
+    owner: ConnectionKey,
     device: AllowedDevice,
     synthetic: bool,
 ) -> io::Result<HandleId> {

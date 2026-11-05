@@ -33,7 +33,7 @@ impl crate::device::DeviceOps for DeviceFaults {
 
 fn attach_device(
     harness: &Harness,
-    owner: ConnectionId,
+    owner: ConnectionKey,
     primary: bool,
     fail_revoke: Arc<AtomicBool>,
     fail_resume: Arc<AtomicBool>,
@@ -68,6 +68,7 @@ fn attach_device(
 
 struct Peer {
     id: ConnectionId,
+    resource_owner: ConnectionKey,
     stream: tokio::net::UnixStream,
 }
 impl Peer {
@@ -173,11 +174,13 @@ impl Harness {
     async fn peer(&self, context: ContextId) -> Peer {
         let publication = self.publication(context).await;
         let id = publication.id();
+        let resource_owner = publication.resource_owner;
         let fd = publication.publish(|_, fd| Ok(fd)).unwrap();
         let stream = UnixStream::from(fd);
         stream.set_nonblocking(true).unwrap();
         Peer {
             id,
+            resource_owner,
             stream: tokio::net::UnixStream::from_std(stream).unwrap(),
         }
     }
@@ -518,7 +521,7 @@ async fn failed_revocation_keeps_successor_disabled_until_autonomous_retry_succe
     let calls = Arc::new(AtomicUsize::new(0));
     let _client_fd = attach_device(
         &harness,
-        predecessor.id,
+        predecessor.resource_owner,
         false,
         fail.clone(),
         Arc::new(AtomicBool::new(false)),
@@ -560,7 +563,7 @@ async fn failed_primary_resume_rolls_back_instead_of_leaving_partial_activation(
     let calls = Arc::new(AtomicUsize::new(0));
     let _client_fd = attach_device(
         &harness,
-        peer.id,
+        peer.resource_owner,
         true,
         Arc::new(AtomicBool::new(false)),
         fail_resume.clone(),

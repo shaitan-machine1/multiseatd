@@ -47,7 +47,7 @@ async fn failed_device_revocation_blocks_kernel_release_even_after_disable_ack()
     let failure = Arc::new(AtomicBool::new(true));
     let _client_fd = attach_device(
         &harness,
-        peer.id,
+        peer.resource_owner,
         false,
         failure.clone(),
         Arc::new(AtomicBool::new(false)),

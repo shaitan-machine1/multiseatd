@@ -6,132 +6,24 @@
 //! global index lock is held over an ioctl, xattr operation or await.
 
 use crate::acl::{NodeIdentity, PinnedNode};
-use crate::device::{AllowedDevice, DeviceKind, DeviceOps, KernelDeviceOps};
-use libmultiseatd::ConnectionId;
+use crate::device::AllowedDevice;
+#[cfg(test)]
+use crate::device::DeviceKind;
+#[cfg(any(test, feature = "test-support"))]
+use crate::device::DeviceOps;
+#[cfg(test)]
+use ConnectionKey as ConnectionId;
+use dev_broker::resources::Resources as BrokerResources;
+pub use dev_broker::{
+    permit::Permit,
+    resources::{ConnectionKey, HandleId},
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-
-type DeviceKey = u64;
-type DeviceRecords = BTreeMap<HandleId, Arc<Mutex<DeviceRecord>>>;
-type CardKeys = BTreeMap<DeviceKey, Arc<Mutex<KeyState>>>;
-
-#[derive(Default)]
-struct KeyState {
-    master: Option<HandleId>,
-    blocked: BTreeSet<HandleId>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct HandleId(u64);
-
-/// One activation generation. A fence never reopens; resumption creates a new
-/// permit. Old queued jobs cannot become current by observing a reused boolean.
-#[derive(Clone)]
-pub struct Permit {
-    open: Arc<AtomicBool>,
-    parents: Vec<Arc<AtomicBool>>,
-    lifetime: Option<crate::registry::Registration>,
-}
-
-impl Default for Permit {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Permit {
-    pub fn new() -> Self {
-        Self {
-            open: Arc::new(AtomicBool::new(true)),
-            parents: Vec::new(),
-            lifetime: None,
-        }
-    }
-    pub fn for_context(lifetime: crate::registry::Registration) -> Self {
-        Self {
-            lifetime: Some(lifetime),
-            ..Self::new()
-        }
-    }
-
-    pub fn gated(&self, gate: Arc<AtomicBool>) -> Self {
-        let mut child = self.child();
-        child.parents.push(gate);
-        child
-    }
-
-    pub fn child(&self) -> Self {
-        let mut parents = self.parents.clone();
-        parents.push(self.open.clone());
-        Self {
-            open: Arc::new(AtomicBool::new(true)),
-            parents,
-            lifetime: self.lifetime.clone(),
-        }
-    }
-
-    pub fn gate(&self) -> Arc<AtomicBool> {
-        self.open.clone()
-    }
-
-    pub fn fence(&self) {
-        self.open.store(false, Ordering::Release);
-    }
-    pub fn is_open(&self) -> bool {
-        self.open.load(Ordering::Acquire)
-            && self
-                .parents
-                .iter()
-                .all(|parent| parent.load(Ordering::Acquire))
-            && self
-                .lifetime
-                .as_ref()
-                .is_none_or(crate::registry::Registration::is_live)
-    }
-}
-
-struct DeviceRecord {
-    owner: ConnectionId,
-    device: AllowedDevice,
-    key: Arc<Mutex<KeyState>>,
-    fd: Option<OwnedFd>,
-    active: bool,
-    retired: bool,
-    ops: Box<dyn DeviceOps>,
-}
-
-impl DeviceRecord {
-    fn resume(&mut self) -> io::Result<()> {
-        let fd = self.fd.as_ref().ok_or_else(stopped)?;
-        // If activation fails/panics, conservatively retain revocation work.
-        self.active = true;
-        self.ops.activate(self.device.kind, fd)
-    }
-
-    fn revoke(&mut self) -> io::Result<()> {
-        if self.active {
-            self.ops.deactivate(
-                self.device.kind,
-                self.fd.as_ref().expect("active description"),
-            )?;
-            self.active = false;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for DeviceRecord {
-    fn drop(&mut self) {
-        // Last-resort unwinding protection, not normal resource reconciliation.
-        if let Err(error) = attempt(|| self.revoke()) {
-            tracing::error!(%error, "final brokered description revocation failed");
-        }
-    }
-}
 
 struct NodeRecord {
     pinned: PinnedNode,
@@ -139,16 +31,11 @@ struct NodeRecord {
 }
 
 pub struct Resources {
-    devices: Mutex<DeviceRecords>,
-    keys: Mutex<CardKeys>,
+    broker: BrokerResources,
     nodes: Mutex<BTreeMap<NodeIdentity, Arc<Mutex<NodeRecord>>>>,
     #[cfg(test)]
     acl_failures: Mutex<BTreeMap<NodeIdentity, usize>>,
-    #[cfg(test)]
-    open_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     closing: AtomicBool,
-    next: AtomicU64,
-    device_limit: usize,
     node_limit: usize,
 }
 
@@ -161,240 +48,59 @@ impl Resources {
             ));
         }
         Ok(Self {
-            devices: Mutex::new(BTreeMap::new()),
-            keys: Mutex::new(BTreeMap::new()),
+            broker: BrokerResources::new(device_limit)?,
             nodes: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             acl_failures: Mutex::new(BTreeMap::new()),
-            #[cfg(test)]
-            open_hook: Mutex::new(None),
             closing: AtomicBool::new(false),
-            next: AtomicU64::new(1),
-            device_limit,
             node_limit,
         })
     }
 
-    pub fn reserve(&self, owner: ConnectionId, device: AllowedDevice) -> io::Result<HandleId> {
-        self.reserve_with(owner, device, Box::<KernelDeviceOps>::default())
+    pub fn reserve(&self, owner: ConnectionKey, device: AllowedDevice) -> io::Result<HandleId> {
+        self.broker.reserve(owner, device)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reserve_with(
         &self,
-        owner: ConnectionId,
+        owner: ConnectionKey,
         device: AllowedDevice,
         ops: Box<dyn DeviceOps>,
     ) -> io::Result<HandleId> {
-        let mut records = lock(&self.devices);
-        if self.closing.load(Ordering::Acquire) {
-            return Err(stopped());
-        }
-        if records.len() == self.device_limit {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "broker handle limit reached",
-            ));
-        }
-        // The device-index lock serializes allocation (including overflow).
-        let value = self.next.load(Ordering::Relaxed);
-        self.next.store(
-            value
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("handle ID exhaustion"))?,
-            Ordering::Relaxed,
-        );
-        let id = HandleId(value);
-        let key = lock(&self.keys)
-            .entry(device.device_number)
-            .or_default()
-            .clone();
-        records.insert(
-            id,
-            Arc::new(Mutex::new(DeviceRecord {
-                owner,
-                device,
-                key,
-                fd: None,
-                active: false,
-                retired: false,
-                ops,
-            })),
-        );
-        Ok(id)
+        self.broker.reserve_with(owner, device, ops)
     }
 
-    fn record(&self, id: HandleId) -> io::Result<Arc<Mutex<DeviceRecord>>> {
-        lock(&self.devices)
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
-    }
-
-    /// Run in an admitted blocking worker. A result FD is only a duplicate;
-    /// the server's original is retained before any caller can receive it.
     pub fn open(&self, id: HandleId, permit: &Permit) -> io::Result<OwnedFd> {
-        let record = self.record(id)?;
-        let mut record = lock(&record);
-        let key = record.key.clone();
-        let mut master = lock(&key);
-        if record.retired || self.closing.load(Ordering::Acquire) || !permit.is_open() {
-            return Err(stopped());
-        }
-        if !master.blocked.is_empty() {
-            return Err(io::Error::from_raw_os_error(libc::EBUSY));
-        }
-        if record.fd.is_none() {
-            if record.device.kind == DeviceKind::DrmPrimary && master.master.is_some() {
-                return Err(io::Error::from_raw_os_error(libc::EBUSY));
-            }
-            #[cfg(test)]
-            {
-                let hook = lock(&self.open_hook).clone();
-                if let Some(hook) = hook {
-                    hook();
-                }
-            }
-            let device = record.device.clone();
-            let fd = record.ops.open(&device)?;
-            record.fd = Some(fd);
-            record.active = true;
-            if record.device.kind == DeviceKind::DrmPrimary {
-                master.master = Some(id);
-            }
-        } else if !record.active {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-        // Fencing during a started open cannot publish a late description.
-        // Leave its original retained for the cleanup barrier, even on error.
-        if self.closing.load(Ordering::Acquire) || !permit.is_open() {
-            return Err(stopped());
-        }
-        record.fd.as_ref().expect("opened description").try_clone()
+        self.broker.open(id, permit)
     }
 
-    /// Ordinary disable preserves primary-node descriptions for master resume.
-    /// Input descriptions are permanently revoked and never reused.
     pub fn deactivate(&self, id: HandleId) -> io::Result<()> {
-        let record = match self.record(id) {
-            Ok(record) => record,
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        let mut entry = lock(&record);
-        let key = entry.key.clone();
-        let mut state = lock(&key);
-        state.blocked.insert(id);
-        entry.revoke()?;
-        state.blocked.remove(&id);
-        if state.master == Some(id) {
-            state.master = None;
-        }
-        if entry.device.kind != DeviceKind::DrmPrimary {
-            entry.retired = true;
-            entry.fd.take();
-        }
-        Ok(())
+        self.broker.deactivate(id)
     }
 
     pub fn activate(&self, id: HandleId, permit: &Permit) -> io::Result<()> {
-        let record = self.record(id)?;
-        let mut entry = lock(&record);
-        let key = entry.key.clone();
-        let mut state = lock(&key);
-        if entry.retired || self.closing.load(Ordering::Acquire) || !permit.is_open() {
-            return Err(stopped());
-        }
-        if entry.device.kind != DeviceKind::DrmPrimary || entry.fd.is_none() {
-            return Ok(());
-        }
-        if !state.blocked.is_empty() || state.master.is_some_and(|owner| owner != id) {
-            return Err(io::Error::from_raw_os_error(libc::EBUSY));
-        }
-        if !entry.active {
-            state.master = Some(id);
-            entry.resume()?;
-        }
-        Ok(())
+        self.broker.activate(id, permit)
     }
 
-    fn owner_records(&self, owner: ConnectionId) -> Vec<HandleId> {
-        let records: Vec<_> = lock(&self.devices)
-            .iter()
-            .map(|(id, entry)| (*id, entry.clone()))
-            .collect();
-        records
-            .into_iter()
-            .filter_map(|(id, entry)| (lock(&entry).owner == owner).then_some(id))
-            .collect()
+    pub fn deactivate_owner(&self, owner: ConnectionKey) -> Vec<io::Error> {
+        self.broker.deactivate_owner(owner)
     }
 
-    pub fn deactivate_owner(&self, owner: ConnectionId) -> Vec<io::Error> {
-        self.owner_records(owner)
-            .into_iter()
-            .filter_map(|id| self.deactivate(id).err())
-            .collect()
+    pub fn activate_owner(&self, owner: ConnectionKey, permit: &Permit) -> Vec<io::Error> {
+        self.broker.activate_owner(owner, permit)
     }
 
-    pub fn activate_owner(&self, owner: ConnectionId, permit: &Permit) -> Vec<io::Error> {
-        self.owner_records(owner)
-            .into_iter()
-            .filter_map(|id| {
-                let record = self.record(id).ok()?;
-                let eligible = {
-                    let entry = lock(&record);
-                    !entry.retired
-                        && entry.device.kind == DeviceKind::DrmPrimary
-                        && entry.fd.is_some()
-                };
-                if eligible {
-                    self.activate(id, permit).err()
-                } else {
-                    None
-                }
-            })
-            .collect()
+    pub fn close_owner(&self, owner: ConnectionKey) -> Vec<io::Error> {
+        self.broker.close_owner(owner)
     }
 
-    pub fn close_owner(&self, owner: ConnectionId) -> Vec<io::Error> {
-        self.owner_records(owner)
-            .into_iter()
-            .filter_map(|id| self.close(id).err())
-            .collect()
+    pub fn owner(&self, id: HandleId) -> io::Result<ConnectionKey> {
+        self.broker.owner(id)
     }
 
-    pub fn owner(&self, id: HandleId) -> io::Result<ConnectionId> {
-        let record = self.record(id)?;
-        let owner = lock(&record).owner;
-        Ok(owner)
-    }
-
-    /// Irreversible record close. Failure keeps its original and master claim,
-    /// independently of a deleted membership, so conflicting access stays shut.
     pub fn close(&self, id: HandleId) -> io::Result<()> {
-        let record = match self.record(id) {
-            Ok(record) => record,
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        let mut entry = lock(&record);
-        let key = entry.key.clone();
-        let mut master = lock(&key);
-        entry.retired = true;
-        // Install the conflict fence BEFORE the ioctl, including unwind paths.
-        master.blocked.insert(id);
-        entry.revoke()?;
-        entry.fd.take();
-        master.blocked.remove(&id);
-        if master.master == Some(id) {
-            master.master = None;
-        }
-        drop(master);
-        drop(entry);
-        lock(&self.devices).remove(&id);
-        // Only remove a key when no other reserved description references it.
-        // This keeps physical-key serialization stable across generations.
-        lock(&self.keys).retain(|_, key| Arc::strong_count(key) > 1);
-        Ok(())
+        self.broker.close(id)
     }
 
     pub fn pin(&self, path: &Path) -> io::Result<NodeIdentity> {
@@ -446,7 +152,7 @@ impl Resources {
 
     #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn set_open_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
-        *lock(&self.open_hook) = hook;
+        self.broker.set_open_hook(hook);
     }
 
     #[cfg(test)]
@@ -502,10 +208,11 @@ impl Resources {
 
     pub fn fence(&self) {
         self.closing.store(true, Ordering::Release);
+        self.broker.fence();
     }
 
     pub fn pending(&self) -> (usize, usize) {
-        (lock(&self.devices).len(), lock(&self.nodes).len())
+        (self.broker.pending(), lock(&self.nodes).len())
     }
 
     /// Independent attempts; one ioctl failure or poisoned record does not skip
@@ -513,14 +220,8 @@ impl Resources {
     /// resource locks. Persistent kernel refusal remains owned for retry.
     pub fn cleanup(&self) -> Vec<io::Error> {
         self.fence();
-        let devices: Vec<_> = lock(&self.devices).keys().copied().collect();
         let nodes: Vec<_> = lock(&self.nodes).keys().copied().collect();
-        let mut errors = Vec::new();
-        for id in devices {
-            if let Err(error) = attempt(|| self.close(id)) {
-                errors.push(error);
-            }
-        }
+        let mut errors = self.broker.cleanup();
         for identity in nodes {
             if let Err(error) = attempt(|| self.clear(identity)) {
                 errors.push(error);

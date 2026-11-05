@@ -9,7 +9,7 @@ mod terminal;
 
 use crate::daemon::{Shutdown, ShutdownPhase};
 use crate::registry::Registration;
-use crate::resources::{Permit, Resources};
+use crate::resources::{ConnectionKey, Permit, Resources};
 use crate::seatd::protocol as wire;
 use libmultiseatd::contract::{ConnectionRow, ContextRow, ErrorKind, SeatRow};
 use libmultiseatd::{ConnectionId, ContextId};
@@ -126,6 +126,8 @@ impl Port {
 
 pub struct ConnectionPublication {
     id: ConnectionId,
+    #[cfg(test)]
+    resource_owner: ConnectionKey,
     fd: Option<OwnedFd>,
     close: connection::Close,
     lifetime: Registration,
@@ -194,6 +196,7 @@ impl Membership {
 }
 
 struct Client {
+    resource_owner: ConnectionKey,
     slots: BTreeMap<i32, broker::Slot>,
     next_slot: i32,
     operations: usize,
@@ -579,6 +582,7 @@ impl Controller {
             return Err(ErrorKind::BackendFailure);
         }
         let lifetime = state.lifetime.clone();
+        let resource_owner = ConnectionKey::generate();
         let (port, output, closed) = connection::channel();
         let close = port.close.clone();
         let requests = self.request_sender.clone();
@@ -592,6 +596,7 @@ impl Controller {
         self.clients.insert(
             id,
             Client {
+                resource_owner,
                 slots: BTreeMap::new(),
                 next_slot: 1,
                 operations: 0,
@@ -618,6 +623,8 @@ impl Controller {
             .insert(id);
         Ok(ConnectionPublication {
             id,
+            #[cfg(test)]
+            resource_owner,
             fd: Some(endpoint.into()),
             close,
             lifetime,
@@ -758,11 +765,11 @@ impl Controller {
             return false;
         };
         let resources = self.resources.clone();
-        let owners: Vec<(ConnectionId, Option<Permit>)> = match job {
+        let owners: Vec<(ConnectionKey, Option<Permit>)> = match job {
             Job::Revoke(id) => self.contexts[&id]
                 .connections
                 .iter()
-                .map(|owner| (*owner, None))
+                .map(|owner| (self.clients[owner].resource_owner, None))
                 .collect(),
             Job::Prepare(id) => {
                 let context = &self.contexts[&id];
@@ -781,11 +788,11 @@ impl Controller {
                         }
                         let permit = epoch.gated(client.port.close.gate());
                         client.epoch = Some(permit.clone());
-                        Some((*id, Some(permit)))
+                        Some((client.resource_owner, Some(permit)))
                     })
                     .collect()
             }
-            Job::Close(id) => vec![(id, None)],
+            Job::Close(id) => vec![(self.clients[&id].resource_owner, None)],
             Job::Access(_) | Job::IdleAccess => Vec::new(),
         };
         let (nodes, users, node_permit) = match job {

@@ -94,6 +94,11 @@ impl Registration {
     pub fn is_live(&self) -> bool {
         self.0.phase.load(Ordering::Acquire) != ABANDONED
     }
+
+    pub fn permit(&self) -> dev_broker::permit::Permit {
+        let lifetime = self.clone();
+        dev_broker::permit::Permit::with_lifetime(move || lifetime.is_live())
+    }
 }
 
 /// Unpublished endpoint owner. Prepare the context in its seat controller before
