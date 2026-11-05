@@ -6,12 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-test-support = []
+test-support = ["dev-broker/test-support"]
 
 [dependencies]
 clap.workspace = true
 hex.workspace = true
 dbus.workspace = true
+dev-broker.workspace = true
 libc.workspace = true
 nix.workspace = true
 rustix.workspace = true

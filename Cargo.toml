@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/lib-multiseatd",
   "crates/multiseatd",
+  "crates/dev-broker",
   "crates/seat-launch",
   "crates/seat-udev",
 ]
@@ -16,6 +17,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
 dbus = "0.9.12"
+dev-broker = { path = "crates/dev-broker" }
 hex = "0.4"
 libc = "0.2"
 lib-multiseatd = { path = "crates/lib-multiseatd" }

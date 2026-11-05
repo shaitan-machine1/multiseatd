@@ -1,0 +1,19 @@
+[package]
+name = "dev-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+libc.workspace = true
+nix.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

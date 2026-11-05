@@ -62,8 +62,9 @@ This describes the upcoming per-seat interface, not the current v2 global daemon
 ## Regression migration
 
 Correct framing, malformed/fragmented traffic, ancillary truncation/ownership and
-terminal EOF tests were moved from the former server crate to `seatd/` in the
-daemon. Kernel device routines/tests were retained and extended with inode checks
+terminal EOF tests now live in `dev-broker/src/seatd/`, extracted from the
+daemon without context or udev policy. Kernel device routines/tests likewise
+live in `dev-broker/src/device.rs`, retained and extended with inode checks
 and required primary master acquisition. ACL owner/group/mask tests remain.
 
 The old server/coordinator policy tests have been replaced, not silently retained

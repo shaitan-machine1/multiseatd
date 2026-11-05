@@ -5,8 +5,14 @@ explicit UID access grants. Installable pieces are `multiseatd`, `seat-udev`,
 `lib-multiseatd` (Rust library `libmultiseatd`) and the `seat-launch` exec wrapper.
 
 The incompatible v2 API replaces the former client-lease interface. No old bus
-name, compatibility adapter, separate server crate or seat-launch remains.
+name, compatibility adapter or separate server daemon remains. Seat-launch is
+the fresh-connection exec wrapper, not the retired per-client launcher API.
 See [API](docs/API.md) and [behavior/security limits](docs/BEHAVIOR.md).
+
+The per-seat rewrite is in progress: the CLI/API below still describe the global
+v2 implementation. The five-crate workspace now includes context-unaware
+`dev-broker` kernel/framing/descriptor primitives; connection/inventory ownership
+and the per-seat control-plane migration are not yet complete.
 
 ## Operation
 
@@ -36,7 +42,7 @@ MULTISEATD_AUTHORITY_FD=3 /usr/libexec/multiseatd/seat-launch /usr/bin/weston
 ```
 
 FD 3 must really be inherited from an authorized controller; the number/environment
-is not authentication. With-seat obtains a fresh connection, sets seat/VT metadata
+is not authentication. Seat-launch obtains a fresh connection, sets seat/VT metadata
 from the daemon, closes authority/unlisted FDs and execs. It does not activate,
 perform PAM, change credentials or create a session supervisor. Ordinary programs
 receive only the intended seatd endpoint, not full authority or a Linux VT.
