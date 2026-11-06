@@ -12,6 +12,7 @@ use crate::daemon::{Shutdown, ShutdownPhase};
 use crate::registry::Registration;
 use crate::resources::{ConnectionKey, Permit, Resources};
 use crate::seatd::protocol as wire;
+use dev_broker::connections::{Connections, Membership};
 use libmultiseatd::contract::{ConnectionRow, ContextRow, ErrorKind, SeatRow};
 use libmultiseatd::{ConnectionId, ContextId};
 use seat_udev::SeatName;
@@ -182,38 +183,11 @@ struct ContextState {
     removed: Vec<Reply>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Membership {
-    Connected,
-    Disabled,
-    Enabled,
-    PendingDisable,
-}
-impl Membership {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Connected => "connected",
-            Self::Disabled => "disabled",
-            Self::Enabled => "enabled",
-            Self::PendingDisable => "pending-disable",
-        }
-    }
-}
-
-struct Client {
+// Policy association only. Transport membership, epochs and teardown state
+// are owned by dev-broker, not mirrored in this context binding.
+struct Binding {
     operations: usize,
     context: ContextId,
-    membership: Membership,
-    port: connection::Port,
-    epoch: Option<Permit>,
-    gone: bool,
-    closing: bool,
-    cleanup: bool,
-    cleanup_running: bool,
-    retry: Instant,
-    error: String,
-    enabled_tag: Option<u64>,
-    close_seat: Option<oneshot::Sender<()>>,
     removed: Vec<Reply>,
     _quota: OwnedSemaphorePermit,
 }
@@ -255,7 +229,8 @@ pub struct Controller {
     commands: mpsc::Receiver<Command>,
     status: watch::Sender<Status>,
     contexts: BTreeMap<ContextId, ContextState>,
-    clients: BTreeMap<ConnectionId, Client>,
+    clients: BTreeMap<ConnectionId, Binding>,
+    broker_connections: Connections<ConnectionId>,
     requests: mpsc::Receiver<connection::Request>,
     request_sender: mpsc::Sender<connection::Request>,
     events: mpsc::Receiver<connection::Event>,
@@ -277,7 +252,6 @@ pub struct Controller {
     transition: Option<Transition>,
     selected: Option<ContextId>,
     effective: Option<ContextId>,
-    tag: u64,
     vt: Option<crate::vt::Port>,
     vt_facts: Option<watch::Receiver<crate::vt::Facts>>,
     vt_generation: Option<u64>,
@@ -313,6 +287,7 @@ impl Controller {
                 status,
                 contexts: BTreeMap::new(),
                 clients: BTreeMap::new(),
+                broker_connections: Connections::new(4096),
                 requests,
                 request_sender,
                 events,
@@ -339,7 +314,6 @@ impl Controller {
                 transition: None,
                 selected: None,
                 effective: None,
-                tag: 0,
                 vt: None,
                 vt_facts: None,
                 vt_generation: None,
@@ -407,10 +381,9 @@ impl Controller {
                 }
                 changed = terminal::changed(&mut self.vt_facts) => { changed?; }
                 event = self.events.recv() => if let Some(connection::Event::Delivered { connection, tag }) = event
-                    && let Some(client) = self.clients.get_mut(&connection) && client.enabled_tag == Some(tag)
-                {
-                    client.enabled_tag = None;
-                    if let Some(transition) = &mut self.transition { transition.pending_enable.remove(&connection); }
+                    && self.broker_connections.delivered(connection, tag)
+                    && let Some(transition) = &mut self.transition {
+                    transition.pending_enable.remove(&connection);
                 },
                 _ = tick.tick() => {},
                 _ = reconcile.tick() => self.reconcile_access(),
@@ -594,7 +567,7 @@ impl Controller {
             .register(id)
             .map_err(|_| ErrorKind::LimitExceeded)?;
         let (port, output, closed) = connection::channel();
-        let close = port.close.clone();
+        let close = self.broker_connections.add(id, port);
         let requests = self.request_sender.clone();
         let events = self.event_sender.clone();
         self.transports.spawn(async move {
@@ -605,20 +578,9 @@ impl Controller {
         });
         self.clients.insert(
             id,
-            Client {
+            Binding {
                 operations: 0,
                 context,
-                membership: Membership::Connected,
-                port,
-                epoch: None,
-                gone: false,
-                closing: false,
-                cleanup: false,
-                cleanup_running: false,
-                retry: Instant::now(),
-                error: String::new(),
-                enabled_tag: None,
-                close_seat: None,
                 removed: Vec::new(),
                 _quota: quota,
             },
@@ -640,30 +602,12 @@ impl Controller {
     }
 
     fn send(&self, id: ConnectionId, bytes: Vec<u8>, tag: Option<u64>) -> bool {
-        self.clients.get(&id).is_some_and(|client| {
-            client.port.send(connection::Output {
-                bytes,
-                fd: None,
-                tag,
-                quota: None,
-            })
-        })
+        self.broker_connections.send(id, bytes, tag)
     }
 
     fn enable(&mut self, id: ConnectionId) -> io::Result<bool> {
-        self.tag = self
-            .tag
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("output generation exhaustion"))?;
-        let client = self.clients.get_mut(&id).expect("connection");
-        client.membership = Membership::Enabled;
-        client.enabled_tag = Some(self.tag);
-        let context = &self.contexts[&client.context];
-        client.epoch = context
-            .epoch
-            .as_ref()
-            .map(|epoch| epoch.gated(client.port.close.gate()));
-        Ok(self.send(id, wire::empty(wire::SERVER_ENABLE_SEAT), Some(self.tag)))
+        let context = &self.contexts[&self.clients[&id].context];
+        self.broker_connections.enable(id, context.epoch.as_ref())
     }
 
     fn fence_context(&mut self, id: ContextId, pending: &mut BTreeSet<ConnectionId>) {
@@ -682,17 +626,8 @@ impl Controller {
         let connections: Vec<_> = context.connections.iter().copied().collect();
         self.retire_inputs(id);
         for connection in connections {
-            let client = self
-                .clients
-                .get_mut(&connection)
-                .expect("context connection");
-            if let Some(epoch) = &client.epoch {
-                epoch.fence();
-            }
-            if client.membership == Membership::Enabled {
-                client.membership = Membership::PendingDisable;
+            if self.broker_connections.pause(connection) {
                 pending.insert(connection);
-                self.send(connection, wire::empty(wire::SERVER_DISABLE_SEAT), None);
             }
         }
     }
@@ -740,26 +675,15 @@ impl Controller {
     }
 
     fn close_connection(&mut self, id: ConnectionId) {
-        if let Some(client) = self.clients.get_mut(&id) {
-            client.closing = true;
-            client.port.close.signal();
-            if let Some(epoch) = &client.epoch {
-                epoch.fence();
-            }
-        }
+        self.broker_connections.close(id);
     }
 
     fn transport_gone(&mut self, id: ConnectionId) {
-        let Some(client) = self.clients.get_mut(&id) else {
+        if !self.clients.contains_key(&id) {
             return;
-        };
-        client.gone = true;
-        client.closing = true;
-        client.cleanup = true;
-        self.devices.begin_cleanup(id);
-        if let Some(epoch) = &client.epoch {
-            epoch.fence();
         }
+        self.broker_connections.gone(id);
+        self.devices.begin_cleanup(id);
         if let Some(transition) = &mut self.transition {
             transition.pending_disable.remove(&id);
             if transition.pending_enable.remove(&id) {
@@ -783,16 +707,7 @@ impl Controller {
                     .connections
                     .iter()
                     .filter_map(|id| {
-                        let client = self.clients.get_mut(id).expect("context connection");
-                        if client.gone
-                            || client.closing
-                            || client.port.close.is_closed()
-                            || client.membership == Membership::Connected
-                        {
-                            return None;
-                        }
-                        let permit = epoch.gated(client.port.close.gate());
-                        client.epoch = Some(permit.clone());
+                        let permit = self.broker_connections.prepare(*id, &epoch)?;
                         Some((
                             self.devices.owner(*id).expect("connection owner"),
                             Some(permit),
@@ -878,21 +793,11 @@ impl Controller {
                 }
             }
             Job::Close(id) => {
-                let Some(client) = self.clients.get_mut(&id) else {
-                    return;
-                };
-                client.cleanup_running = false;
-                if let Some(error) = completion.error {
-                    client.error = error;
-                    client.retry = Instant::now() + Duration::from_secs(1);
-                } else {
-                    client.cleanup = false;
+                if self
+                    .broker_connections
+                    .cleanup_completed(id, completion.error)
+                {
                     self.devices.cleaned(id);
-                    client.error.clear();
-                    if let Some(done) = client.close_seat.take() {
-                        self.send(id, wire::empty(wire::SERVER_SEAT_CLOSED), None);
-                        let _ = done.send(());
-                    }
                 }
             }
         }
@@ -911,28 +816,33 @@ impl Controller {
         let cleanup: Vec<_> = self
             .clients
             .iter()
-            .filter(|(id, client)| {
+            .filter(|(id, binding)| {
+                let client = &self.broker_connections[id];
                 !self.devices.running(**id)
                     && client.cleanup
                     && !client.cleanup_running
-                    && client.operations == 0
+                    && binding.operations == 0
                     && client.retry <= Instant::now()
             })
             .map(|(id, _)| *id)
             .collect();
         for id in cleanup {
             if self.job(Job::Close(id)) {
-                self.clients.get_mut(&id).expect("client").cleanup_running = true;
+                self.broker_connections.cleanup_started(id);
             }
         }
         let removed: Vec<_> = self
             .clients
             .iter()
-            .filter(|(_, client)| client.gone && !client.cleanup && !client.cleanup_running)
+            .filter(|(id, _)| {
+                let client = &self.broker_connections[id];
+                client.gone && !client.cleanup && !client.cleanup_running
+            })
             .map(|(id, _)| *id)
             .collect();
         for id in removed {
             self.devices.forget(id)?;
+            self.broker_connections.remove(id)?;
             let client = self.clients.remove(&id).expect("client");
             if let Some(context) = self.contexts.get_mut(&client.context) {
                 context.connections.remove(&id);
@@ -1026,7 +936,7 @@ impl Controller {
         }
         if let Some(mut transition) = self.transition.take() {
             transition.pending_disable.retain(|id| {
-                self.clients.get(id).is_some_and(|client| {
+                self.broker_connections.get(id).is_some_and(|client| {
                     !client.gone && client.membership == Membership::PendingDisable
                 })
             });
@@ -1082,7 +992,7 @@ impl Controller {
                             .iter()
                             .copied()
                             .filter(|id| {
-                                self.clients.get(id).is_some_and(|client| {
+                                self.broker_connections.get(id).is_some_and(|client| {
                                     client.membership == Membership::Disabled && !client.closing
                                 })
                             })
@@ -1148,30 +1058,8 @@ impl Controller {
         let Some(client) = self.clients.get(&id) else {
             return Ok(());
         };
-        if client.closing
-            || client.port.close.is_closed()
-            || !self.contexts[&client.context].lifetime.is_live()
-        {
-            self.close_connection(id);
-            return Ok(());
-        }
-        let member = client.membership != Membership::Connected;
-        let valid = match packet.opcode {
-            wire::CLIENT_OPEN_SEAT
-            | wire::CLIENT_CLOSE_SEAT
-            | wire::CLIENT_DISABLE_SEAT
-            | wire::CLIENT_PING => wire::parse_empty(&packet.payload),
-            wire::CLIENT_OPEN_DEVICE => wire::parse_path(&packet.payload).map(|_| ()),
-            wire::CLIENT_CLOSE_DEVICE | wire::CLIENT_SWITCH_SESSION => {
-                wire::parse_i32(&packet.payload).map(|_| ())
-            }
-            _ => Err(libc::EBADMSG),
-        };
-        if valid.is_err()
-            || (packet.opcode != wire::CLIENT_OPEN_SEAT
-                && packet.opcode != wire::CLIENT_PING
-                && !member)
-            || (packet.opcode == wire::CLIENT_OPEN_SEAT && member)
+        if !self.contexts[&client.context].lifetime.is_live()
+            || !self.broker_connections.valid_packet(id, &packet)
         {
             self.close_connection(id);
             return Ok(());
@@ -1181,10 +1069,9 @@ impl Controller {
                 self.send(id, wire::empty(wire::SERVER_PONG), None);
             }
             wire::CLIENT_OPEN_SEAT => {
-                if self.clients[&id].cleanup {
+                if !self.broker_connections.open_seat(id) {
                     self.send(id, wire::error(libc::EBUSY), None);
                 } else {
-                    self.clients.get_mut(&id).expect("client").membership = Membership::Disabled;
                     self.send(id, wire::seat_opened(self.name.as_str())?, None);
                     let context = self.clients[&id].context;
                     if self.effective == Some(context) {
@@ -1202,14 +1089,8 @@ impl Controller {
                 }
             }
             wire::CLIENT_CLOSE_SEAT => {
-                let client = self.clients.get_mut(&id).expect("client");
-                client.membership = Membership::Connected;
-                client.cleanup = true;
+                self.broker_connections.close_seat(id, done);
                 self.devices.begin_cleanup(id);
-                client.close_seat = Some(done);
-                if let Some(epoch) = &client.epoch {
-                    epoch.fence();
-                }
                 if let Some(transition) = &mut self.transition {
                     transition.pending_disable.remove(&id);
                     transition.pending_enable.remove(&id);
@@ -1217,14 +1098,7 @@ impl Controller {
                 return Ok(());
             }
             wire::CLIENT_DISABLE_SEAT => {
-                if self.clients[&id].membership == Membership::PendingDisable
-                    || self.clients[&id].membership == Membership::Disabled
-                {
-                    self.clients.get_mut(&id).expect("client").membership = Membership::Disabled;
-                    self.send(id, wire::empty(wire::SERVER_SEAT_DISABLED), None);
-                } else {
-                    self.close_connection(id);
-                }
+                self.broker_connections.acknowledge(id);
             }
             wire::CLIENT_OPEN_DEVICE => {
                 self.open_device(
@@ -1290,8 +1164,8 @@ impl Controller {
                         id.to_string(),
                         client.context.to_string(),
                         self.name.to_string(),
-                        client.membership.name().into(),
-                        client.error.clone(),
+                        self.broker_connections[id].membership.name().into(),
+                        self.broker_connections[id].error.clone(),
                     ),
                 )
             })

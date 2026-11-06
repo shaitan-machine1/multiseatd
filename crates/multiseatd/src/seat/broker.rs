@@ -9,10 +9,10 @@ impl Controller {
         path: PathBuf,
         done: oneshot::Sender<()>,
     ) {
-        let client = &self.clients[&id];
+        let client = &self.broker_connections[&id];
         let permit = client.epoch.clone().filter(|epoch| {
             epoch.is_open()
-                && self.effective == Some(client.context)
+                && self.effective == Some(self.clients[&id].context)
                 && client.membership == Membership::Enabled
                 && !self.topology_paused
         });
@@ -52,8 +52,8 @@ impl Controller {
             .filter(|(_, client)| client.context == context)
             .any(|(id, client)| {
                 client.operations != 0
-                    || client.cleanup
-                    || client.cleanup_running
+                    || self.broker_connections[id].cleanup
+                    || self.broker_connections[id].cleanup_running
                     || self.devices.pending(*id)
             })
     }
@@ -67,13 +67,13 @@ impl Controller {
         if self.devices.owner(id) != Some(reply.owner) {
             return;
         }
-        if let Some(client) = self.clients.get_mut(&id) {
-            if let Some(error) = reply.error {
-                client.error = error;
-            }
-            if let Some(output) = reply.output {
-                client.port.send(output);
-            }
+        if let Some(error) = reply.error {
+            self.broker_connections.error(id, error);
+        }
+        if let Some(client) = self.broker_connections.get(&id)
+            && let Some(output) = reply.output
+        {
+            client.send(output);
         }
         if reply.disconnect {
             self.close_connection(id);

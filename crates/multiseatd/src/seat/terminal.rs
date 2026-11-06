@@ -125,11 +125,11 @@ impl Controller {
         target: i32,
         done: oneshot::Sender<()>,
     ) {
-        let client = &self.clients[&connection];
+        let client = &self.broker_connections[&connection];
         let error = if self.vt.is_none() {
             Some(libc::ENOTSUP)
         } else if client.membership != Membership::Enabled
-            || self.effective != Some(client.context)
+            || self.effective != Some(self.clients[&connection].context)
             || !client.epoch.as_ref().is_some_and(Permit::is_open)
             || !self.foreground()
         {
