@@ -295,6 +295,13 @@ impl Resources {
             .collect()
     }
 
+    /// Immutable ownership remains queryable even while a driver is blocked.
+    pub fn has_owner(&self, owner: ConnectionKey) -> bool {
+        lock(&self.devices)
+            .values()
+            .any(|entry| entry.owner == owner)
+    }
+
     pub fn owner(&self, id: HandleId) -> io::Result<ConnectionKey> {
         lock(&self.devices)
             .get(&id)

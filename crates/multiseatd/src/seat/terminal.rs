@@ -84,7 +84,7 @@ impl Controller {
         if facts.phase == Phase::Releasing
             && self.vt_release_sent != Some(facts.generation)
             && self.jobs.is_empty()
-            && self.device_jobs.is_empty()
+            && !self.devices.has_jobs()
             && self.switches.is_empty()
             && self.access.is_none()
             && self

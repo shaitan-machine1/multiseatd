@@ -196,9 +196,6 @@ impl Membership {
 }
 
 struct Client {
-    resource_owner: ConnectionKey,
-    slots: BTreeMap<i32, broker::Slot>,
-    next_slot: i32,
     operations: usize,
     context: ContextId,
     membership: Membership,
@@ -261,7 +258,7 @@ pub struct Controller {
     transports: JoinSet<(ConnectionId, io::Result<()>)>,
     jobs: JoinSet<Completion>,
     resources: Arc<Resources>,
-    inventory: dev_broker::inventory::Inventory,
+    devices: dev_broker::devices::Devices<ConnectionId>,
     access: Option<grants::Change>,
     idle_access: bool,
     policy: policy::Policy,
@@ -270,7 +267,6 @@ pub struct Controller {
     policy_gate: watch::Sender<Permit>,
     topology_paused: bool,
     resume_policy: bool,
-    device_jobs: JoinSet<broker::Completion>,
     budget: Budget,
     mutations: VecDeque<Mutation>,
     transition: Option<Transition>,
@@ -318,8 +314,13 @@ impl Controller {
                 event_sender,
                 transports: JoinSet::new(),
                 jobs: JoinSet::new(),
+                devices: dev_broker::devices::Devices::new(
+                    resources.broker(),
+                    budget.workers.clone(),
+                    budget.descriptors.clone(),
+                    4096,
+                ),
                 resources,
-                inventory: dev_broker::inventory::Inventory::new(),
                 policy: policy::Policy::default(),
                 access: None,
                 idle_access: false,
@@ -328,7 +329,6 @@ impl Controller {
                 policy_gate: policy_gate.clone(),
                 topology_paused: false,
                 resume_policy: false,
-                device_jobs: JoinSet::new(),
                 budget,
                 mutations: VecDeque::new(),
                 transition: None,
@@ -367,7 +367,7 @@ impl Controller {
             if stopping
                 && self.transports.is_empty()
                 && self.jobs.is_empty()
-                && self.device_jobs.is_empty()
+                && !self.devices.has_jobs()
                 && self.switches.is_empty()
             {
                 return Ok(());
@@ -394,8 +394,8 @@ impl Controller {
                 joined = self.jobs.join_next(), if !self.jobs.is_empty() => {
                     self.complete(joined.expect("job exists").map_err(io::Error::other)?);
                 }
-                joined = self.device_jobs.join_next(), if !self.device_jobs.is_empty() => {
-                    self.device_completed(joined.expect("device job exists").map_err(io::Error::other)?);
+                completed = self.devices.next_completion(), if self.devices.has_jobs() => {
+                    self.device_reply(completed?);
                 }
                 joined = self.switches.join_next(), if !self.switches.is_empty() => {
                     self.switch_completed(joined.expect("switch exists").map_err(io::Error::other)?);
@@ -584,7 +584,10 @@ impl Controller {
             return Err(ErrorKind::BackendFailure);
         }
         let lifetime = state.lifetime.clone();
-        let resource_owner = ConnectionKey::generate();
+        let _resource_owner = self
+            .devices
+            .register(id)
+            .map_err(|_| ErrorKind::LimitExceeded)?;
         let (port, output, closed) = connection::channel();
         let close = port.close.clone();
         let requests = self.request_sender.clone();
@@ -598,9 +601,6 @@ impl Controller {
         self.clients.insert(
             id,
             Client {
-                resource_owner,
-                slots: BTreeMap::new(),
-                next_slot: 1,
                 operations: 0,
                 context,
                 membership: Membership::Connected,
@@ -626,7 +626,7 @@ impl Controller {
         Ok(ConnectionPublication {
             id,
             #[cfg(test)]
-            resource_owner,
+            resource_owner: _resource_owner,
             fd: Some(endpoint.into()),
             close,
             lifetime,
@@ -751,6 +751,7 @@ impl Controller {
         client.gone = true;
         client.closing = true;
         client.cleanup = true;
+        self.devices.begin_cleanup(id);
         if let Some(epoch) = &client.epoch {
             epoch.fence();
         }
@@ -771,7 +772,7 @@ impl Controller {
             Job::Revoke(id) => self.contexts[&id]
                 .connections
                 .iter()
-                .map(|owner| (self.clients[owner].resource_owner, None))
+                .map(|owner| (self.devices.owner(*owner).expect("connection owner"), None))
                 .collect(),
             Job::Prepare(id) => {
                 let context = &self.contexts[&id];
@@ -790,11 +791,14 @@ impl Controller {
                         }
                         let permit = epoch.gated(client.port.close.gate());
                         client.epoch = Some(permit.clone());
-                        Some((client.resource_owner, Some(permit)))
+                        Some((
+                            self.devices.owner(*id).expect("connection owner"),
+                            Some(permit),
+                        ))
                     })
                     .collect()
             }
-            Job::Close(id) => vec![(self.clients[&id].resource_owner, None)],
+            Job::Close(id) => vec![(self.devices.owner(id).expect("connection owner"), None)],
             Job::Access(_) | Job::IdleAccess => Vec::new(),
         };
         let (nodes, users, node_permit) = match job {
@@ -903,7 +907,7 @@ impl Controller {
                     client.retry = Instant::now() + Duration::from_secs(1);
                 } else {
                     client.cleanup = false;
-                    client.slots.clear();
+                    self.devices.cleaned(id);
                     client.error.clear();
                     if let Some(done) = client.close_seat.take() {
                         self.send(id, wire::empty(wire::SERVER_SEAT_CLOSED), None);
@@ -927,8 +931,9 @@ impl Controller {
         let cleanup: Vec<_> = self
             .clients
             .iter()
-            .filter(|(_, client)| {
-                client.cleanup
+            .filter(|(id, client)| {
+                !self.devices.running(**id)
+                    && client.cleanup
                     && !client.cleanup_running
                     && client.operations == 0
                     && client.retry <= Instant::now()
@@ -947,6 +952,7 @@ impl Controller {
             .map(|(id, _)| *id)
             .collect();
         for id in removed {
+            self.devices.forget(id)?;
             let client = self.clients.remove(&id).expect("client");
             if let Some(context) = self.contexts.get_mut(&client.context) {
                 context.connections.remove(&id);
@@ -1219,6 +1225,7 @@ impl Controller {
                 let client = self.clients.get_mut(&id).expect("client");
                 client.membership = Membership::Connected;
                 client.cleanup = true;
+                self.devices.begin_cleanup(id);
                 client.close_seat = Some(done);
                 if let Some(epoch) = &client.epoch {
                     epoch.fence();

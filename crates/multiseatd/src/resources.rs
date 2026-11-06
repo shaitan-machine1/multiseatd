@@ -9,7 +9,7 @@ use crate::acl::{NodeIdentity, PinnedNode};
 use crate::device::AllowedDevice;
 #[cfg(test)]
 use crate::device::DeviceKind;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use crate::device::DeviceOps;
 #[cfg(test)]
 use ConnectionKey as ConnectionId;
@@ -31,7 +31,7 @@ struct NodeRecord {
 }
 
 pub struct Resources {
-    broker: BrokerResources,
+    broker: Arc<BrokerResources>,
     nodes: Mutex<BTreeMap<NodeIdentity, Arc<Mutex<NodeRecord>>>>,
     #[cfg(test)]
     acl_failures: Mutex<BTreeMap<NodeIdentity, usize>>,
@@ -48,7 +48,7 @@ impl Resources {
             ));
         }
         Ok(Self {
-            broker: BrokerResources::new(device_limit)?,
+            broker: Arc::new(BrokerResources::new(device_limit)?),
             nodes: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             acl_failures: Mutex::new(BTreeMap::new()),
@@ -57,11 +57,15 @@ impl Resources {
         })
     }
 
+    pub(crate) fn broker(&self) -> Arc<BrokerResources> {
+        self.broker.clone()
+    }
+
     pub fn reserve(&self, owner: ConnectionKey, device: AllowedDevice) -> io::Result<HandleId> {
         self.broker.reserve(owner, device)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn reserve_with(
         &self,
         owner: ConnectionKey,

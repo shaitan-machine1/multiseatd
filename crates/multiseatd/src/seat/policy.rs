@@ -21,7 +21,7 @@ impl Controller {
     pub fn set_initial_policy(&mut self, mut policy: Policy) {
         assert!(self.contexts.is_empty());
         let devices = std::mem::take(&mut policy.devices);
-        self.inventory.replace(devices.values().cloned());
+        self.devices.replace_inventory(devices.values().cloned());
         self.policy = policy;
     }
 
@@ -62,7 +62,7 @@ impl Controller {
         }
         if let Some(mut policy) = self.policy_pending.take() {
             let devices = std::mem::take(&mut policy.devices);
-            self.inventory.replace(devices.values().cloned());
+            self.devices.replace_inventory(devices.values().cloned());
             self.policy = policy;
             self.policy_gate.send_replace(Permit::new());
             self.topology_paused = false;
@@ -76,7 +76,7 @@ impl Controller {
             && self.access.is_none()
             && self.transition.is_none()
             && self.jobs.is_empty()
-            && self.device_jobs.is_empty()
+            && !self.devices.has_jobs()
             && self.contexts.iter().all(|(id, context)| {
                 !context.dirty
                     && !context.preparing

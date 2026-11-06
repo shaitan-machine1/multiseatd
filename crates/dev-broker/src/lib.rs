@@ -4,6 +4,7 @@
 //! tags, select contexts, apply ACLs, or construct an executor.
 pub mod connection;
 pub mod device;
+pub mod devices;
 pub mod inventory;
 pub mod permit;
 pub mod resources;
