@@ -6,6 +6,7 @@ pub mod connection;
 mod grants;
 pub mod policy;
 mod terminal;
+mod work;
 
 use crate::daemon::{Shutdown, ShutdownPhase};
 use crate::registry::Registration;
@@ -70,13 +71,17 @@ pub enum Command {
 pub struct Budget {
     connections: Arc<Semaphore>,
     workers: Arc<Semaphore>,
+    acl_workers: Arc<Semaphore>,
     descriptors: Arc<Semaphore>,
 }
 impl Default for Budget {
     fn default() -> Self {
         Self {
             connections: Arc::new(Semaphore::new(4096)),
-            workers: Arc::new(Semaphore::new(64)),
+            // Match the runtime's four blocking threads without allowing
+            // broker I/O to consume the ACL lane.
+            workers: Arc::new(Semaphore::new(3)),
+            acl_workers: Arc::new(Semaphore::new(1)),
             descriptors: Arc::new(Semaphore::new(1024)),
         }
     }
@@ -764,9 +769,6 @@ impl Controller {
     }
 
     fn job(&mut self, job: Job) -> bool {
-        let Ok(quota) = self.budget.workers.clone().try_acquire_owned() else {
-            return false;
-        };
         let resources = self.resources.clone();
         let owners: Vec<(ConnectionKey, Option<Permit>)> = match job {
             Job::Revoke(id) => self.contexts[&id]
@@ -822,39 +824,17 @@ impl Controller {
             }
             Job::Close(_) => (BTreeSet::new(), BTreeSet::new(), Permit::new()),
         };
-        self.jobs.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let _quota = quota;
-                let mut errors = Vec::new();
-                for (owner, permit) in owners {
-                    errors.extend(match job {
-                        Job::Revoke(_) => resources.deactivate_owner(owner),
-                        Job::Prepare(_) => resources
-                            .activate_owner(owner, permit.as_ref().expect("activation epoch")),
-                        Job::Close(_) => resources.close_owner(owner),
-                        Job::Access(_) | Job::IdleAccess => Vec::new(),
-                    });
-                }
-                for node in nodes {
-                    if let Err(error) = resources.apply(node, &users, &node_permit) {
-                        errors.push(error);
-                    }
-                }
-                Completion {
-                    job,
-                    error: errors.first().map(ToString::to_string),
-                }
-            })
-            .await;
-            match result {
-                Ok(result) => result,
-                Err(error) => std::panic::resume_unwind(if error.is_panic() {
-                    error.into_panic()
-                } else {
-                    Box::new("blocking owner cancelled")
-                }),
+        self.jobs.spawn(
+            work::Work {
+                resources,
+                owners,
+                nodes,
+                users,
+                node_permit,
+                job,
             }
-        });
+            .run(self.budget.workers.clone(), self.budget.acl_workers.clone()),
+        );
         true
     }
 

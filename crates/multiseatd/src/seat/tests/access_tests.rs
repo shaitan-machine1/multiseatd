@@ -44,6 +44,121 @@ impl Harness {
     }
 }
 #[tokio::test]
+async fn saturated_broker_lane_does_not_delay_acl_withdrawal_or_dispatch() {
+    let mut harness = Harness::new();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let node = harness.node(&file);
+    harness
+        .configure(Policy {
+            nodes: BTreeSet::from([node]),
+            ..Policy::default()
+        })
+        .await;
+    let a = harness.context().await;
+    let b = harness.context().await;
+    let mut peer = harness.peer(a).await;
+    peer.open().await;
+    harness.grant(a, 424242, true).await;
+    harness.grant(b, 424244, true).await;
+    harness.activate(a).await;
+    peer.expect(wire::SERVER_ENABLE_SEAT).await;
+    let occupied = harness
+        .budget
+        .workers
+        .clone()
+        .acquire_many_owned(3)
+        .await
+        .unwrap();
+    let mut activation = harness.mutation(b, true);
+    peer.expect(wire::SERVER_DISABLE_SEAT).await;
+    peer.acknowledge().await;
+    timeout(Duration::from_secs(1), async {
+        while has(&file, 424242) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ACL withdrawal waited for broker worker capacity");
+    assert!(!has(&file, 424244));
+    assert!(matches!(
+        activation.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    peer.ping().await;
+    drop(occupied);
+    timeout(Duration::from_secs(4), activation)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(has(&file, 424244));
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn saturated_acl_lane_does_not_delay_broker_revocation() {
+    let mut harness = Harness::new();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let node = harness.node(&file);
+    harness
+        .configure(Policy {
+            nodes: BTreeSet::from([node]),
+            ..Policy::default()
+        })
+        .await;
+    let a = harness.context().await;
+    let b = harness.context().await;
+    let mut peer = harness.peer(a).await;
+    peer.open().await;
+    harness.grant(a, 424242, true).await;
+    harness.grant(b, 424244, true).await;
+    harness.activate(a).await;
+    peer.expect(wire::SERVER_ENABLE_SEAT).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _fd = attach_device(
+        &harness,
+        peer.resource_owner,
+        false,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        calls.clone(),
+    );
+    let occupied = harness
+        .budget
+        .acl_workers
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let mut activation = harness.mutation(b, true);
+    peer.expect(wire::SERVER_DISABLE_SEAT).await;
+    peer.acknowledge().await;
+    timeout(Duration::from_secs(1), async {
+        while calls.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("broker revocation waited for ACL worker capacity");
+    assert!(has(&file, 424242));
+    assert!(!has(&file, 424244));
+    assert!(matches!(
+        activation.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    peer.ping().await;
+    drop(occupied);
+    timeout(Duration::from_secs(4), activation)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!has(&file, 424242));
+    assert!(has(&file, 424244));
+    harness.finish().await;
+}
+
+#[tokio::test]
 async fn failed_source_acl_clear_blocks_successor_grants() {
     let mut harness = Harness::new();
     let file = tempfile::NamedTempFile::new().unwrap();
