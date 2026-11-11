@@ -342,6 +342,23 @@ impl Resources {
     pub fn fence(&self) {
         self.closing.store(true, Ordering::Release);
     }
+    /// A function-local removal batch, including originals no longer in slots.
+    /// Never consults policy or callbacks while performing required withdrawal.
+    pub fn revoke_unlisted(
+        &self,
+        keep: &BTreeMap<std::path::PathBuf, AllowedDevice>,
+    ) -> Vec<io::Error> {
+        let obsolete: Vec<_> = lock(&self.devices)
+            .iter()
+            .filter(|(_, record)| keep.get(&record.device.path) != Some(record.device.as_ref()))
+            .map(|(id, _)| *id)
+            .collect();
+        obsolete
+            .into_iter()
+            .filter_map(|id| self.close(id).err())
+            .collect()
+    }
+
     pub fn pending(&self) -> usize {
         lock(&self.devices).len()
     }

@@ -9,6 +9,10 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicI32, Ordering},
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthorityError {
@@ -27,7 +31,47 @@ struct Cookie(u64);
 
 struct LiveAuthority {
     context: ContextId,
-    anchor: UnixStream,
+    registration: Registration,
+}
+
+/// Resource-local lifetime ownership, never a policy/catalog reference.
+#[derive(Clone)]
+pub struct Registration {
+    anchor: Arc<UnixStream>,
+    alive: Arc<AtomicBool>,
+    error: Arc<AtomicI32>,
+}
+impl Registration {
+    pub fn is_alive(&self) -> io::Result<bool> {
+        let error = self.error.load(Ordering::Acquire);
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        if !self.alive.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let ready = match probe(&self.anchor) {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.alive.store(false, Ordering::Release);
+                let _ = self.error.compare_exchange(
+                    0,
+                    error.raw_os_error().unwrap_or(libc::EIO),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                return Err(error);
+            }
+        };
+        if ready.is_some() {
+            self.alive.store(false, Ordering::Release);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+    pub fn invalidate(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
 }
 
 /// The caller owns the returned endpoint, including publication failure cleanup.
@@ -99,7 +143,17 @@ impl Authorities {
         if self.live.contains_key(&cookie) || self.retired.contains_key(&cookie) {
             return Err(io::Error::other("kernel reused a registered socket cookie").into());
         }
-        self.live.insert(cookie, LiveAuthority { context, anchor });
+        self.live.insert(
+            cookie,
+            LiveAuthority {
+                context,
+                registration: Registration {
+                    anchor: Arc::new(anchor),
+                    alive: Arc::new(AtomicBool::new(true)),
+                    error: Arc::new(AtomicI32::new(0)),
+                },
+            },
+        );
         self.contexts.insert(context, cookie);
         Ok(IssuedAuthority {
             context,
@@ -115,7 +169,7 @@ impl Authorities {
         let entry = self.live.get(&cookie).ok_or(AuthorityError::AccessDenied)?;
         // Do not authorize a shut-down/data-bearing capability just because the
         // controller has not consumed its anchor readiness notification yet.
-        if probe(&entry.anchor)?.is_some() {
+        if !entry.registration.is_alive()? {
             return Err(AuthorityError::AccessDenied);
         }
         Ok(entry.context)
@@ -140,7 +194,9 @@ impl Authorities {
         };
         // Dropping the opposite endpoint is safe: no client device descriptor is
         // owned here. Actual device/ACL revocation belongs to the controller.
-        self.live.remove(&cookie);
+        if let Some(entry) = self.live.remove(&cookie) {
+            entry.registration.invalidate();
+        }
         if self.retired.len() == self.retired_limit {
             let oldest = self
                 .retired_order
@@ -159,7 +215,11 @@ impl Authorities {
     pub fn retire_ready(&mut self) -> Result<Vec<Invalidation>, AuthorityError> {
         let mut invalidated = Vec::new();
         for entry in self.live.values() {
-            if let Some(reason) = probe(&entry.anchor)? {
+            let error = entry.registration.error.load(Ordering::Acquire);
+            if error != 0 {
+                return Err(io::Error::from_raw_os_error(error).into());
+            }
+            if let Some(reason) = probe(&entry.registration.anchor)? {
                 invalidated.push(Invalidation {
                     context: entry.context,
                     reason,
@@ -188,7 +248,18 @@ impl Authorities {
     pub fn anchors(&self) -> impl Iterator<Item = (ContextId, BorrowedFd<'_>)> {
         self.live
             .values()
-            .map(|entry| (entry.context, entry.anchor.as_fd()))
+            .map(|entry| (entry.context, entry.registration.anchor.as_fd()))
+    }
+
+    pub fn registration(&self, context: ContextId) -> Result<Registration, AuthorityError> {
+        let cookie = self
+            .contexts
+            .get(&context)
+            .ok_or(AuthorityError::AccessDenied)?;
+        self.live
+            .get(cookie)
+            .map(|entry| entry.registration.clone())
+            .ok_or(AuthorityError::AccessDenied)
     }
 
     pub fn live_count(&self) -> usize {

@@ -1,22 +1,30 @@
 use super::*;
 use std::os::unix::fs::MetadataExt;
-
-fn fixture(limit: usize) -> Devices<u32> {
-    let mut devices = Devices::new(
-        Arc::new(Resources::new(32).unwrap()),
-        Arc::new(Semaphore::new(4)),
-        Arc::new(Semaphore::new(16)),
-        limit,
-    );
-    let device = AllowedDevice::canonicalized(
+fn device() -> AllowedDevice {
+    AllowedDevice::canonicalized(
         crate::device::DeviceId::new("fixture"),
         "/dev/null",
         std::fs::metadata("/dev/null").unwrap().rdev(),
         DeviceKind::Evdev,
     )
-    .unwrap();
-    devices.replace_inventory([device]);
-    devices
+    .unwrap()
+}
+fn fixture(limit: usize) -> Devices<u32> {
+    Devices::new(
+        Arc::new(Resources::new(32).unwrap()),
+        Arc::new(Semaphore::new(4)),
+        Arc::new(Semaphore::new(16)),
+        limit,
+    )
+}
+fn start() -> oneshot::Receiver<()> {
+    let (sender, receiver) = oneshot::channel();
+    sender.send(()).unwrap();
+    receiver
+}
+#[cfg(feature = "test-support")]
+fn admission() -> Option<(AllowedDevice, Permit)> {
+    Some((device(), Permit::new()))
 }
 fn acknowledge<K>(mut reply: Reply<K>) -> Output {
     if let Some(done) = reply.done.take() {
@@ -27,7 +35,6 @@ fn acknowledge<K>(mut reply: Reply<K>) -> Output {
 fn opcode(output: &Output) -> u16 {
     u16::from_ne_bytes(output.bytes[..2].try_into().unwrap())
 }
-
 #[test]
 fn bounded_registration_and_reused_correlation_have_different_owners() {
     let mut devices = fixture(2);
@@ -36,50 +43,39 @@ fn bounded_registration_and_reused_correlation_have_different_owners() {
     devices.register(8).unwrap();
     assert!(devices.register(9).is_err());
     devices.forget(7).unwrap();
-    let replacement = devices.register(7).unwrap();
-    assert_ne!(first, replacement);
+    assert_ne!(first, devices.register(7).unwrap());
 }
-
 #[test]
 fn retained_original_outside_a_slot_still_prevents_forgetting_its_owner() {
     let mut devices = fixture(1);
     let owner = devices.register(7).unwrap();
-    let (device, _) = devices
-        .inventory
-        .authorize(Path::new("/dev/null"), &Permit::new())
-        .unwrap();
-    let handle = devices.resources.reserve(owner, device).unwrap();
+    let handle = devices.resources.reserve(owner, device()).unwrap();
     assert!(devices.forget(7).is_err());
     devices.resources.close(handle).unwrap();
     devices.forget(7).unwrap();
 }
-
 #[test]
 fn fenced_or_unpublished_paths_never_start_kernel_work() {
     let mut devices = fixture(1);
     devices.register(7).unwrap();
     let permit = Permit::new();
     permit.fence();
-    for (path, permit) in [
-        ("/dev/null", permit),
-        ("/not/published/../null", Permit::new()),
-    ] {
+    // Exact path lookup is now the caller's catalog responsibility. A failed
+    // lookup supplies no admission, never a path for this broker to authorize.
+    for admission in [Some((device(), permit)), None] {
         let (done, _) = oneshot::channel();
-        let reply = devices
-            .open(7, Path::new(path), &permit, false, done)
-            .unwrap();
+        let reply = devices.open(7, admission, start(), false, done).unwrap();
         assert_eq!(opcode(&acknowledge(reply)), wire::SERVER_ERROR);
         assert!(!devices.has_jobs());
         assert!(!devices.pending(7));
     }
 }
-
 #[cfg(feature = "test-support")]
 async fn open(devices: &mut Devices<u32>, key: u32) -> Output {
     let (done, receiver) = oneshot::channel();
     assert!(
         devices
-            .open(key, Path::new("/dev/null"), &Permit::new(), true, done)
+            .open(key, admission(), start(), true, done)
             .is_none()
     );
     let output = acknowledge(devices.next_completion().await.unwrap());
@@ -87,23 +83,16 @@ async fn open(devices: &mut Devices<u32>, key: u32) -> Output {
     assert_eq!(opcode(&output), wire::SERVER_DEVICE_OPENED);
     output
 }
-
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn outstanding_open_fences_forget_and_parallel_slot_allocation() {
     let mut devices = fixture(1);
     devices.register(7).unwrap();
     let (done, receiver) = oneshot::channel();
-    assert!(
-        devices
-            .open(7, Path::new("/dev/null"), &Permit::new(), true, done)
-            .is_none()
-    );
+    assert!(devices.open(7, admission(), start(), true, done).is_none());
     assert!(devices.forget(7).is_err());
     let (other, _) = oneshot::channel();
-    let denied = devices
-        .open(7, Path::new("/dev/null"), &Permit::new(), true, other)
-        .unwrap();
+    let denied = devices.open(7, admission(), start(), true, other).unwrap();
     assert_eq!(opcode(&acknowledge(denied)), wire::SERVER_ERROR);
     acknowledge(devices.next_completion().await.unwrap());
     receiver.await.unwrap();
@@ -114,7 +103,6 @@ async fn outstanding_open_fences_forget_and_parallel_slot_allocation() {
     devices.cleaned(7);
     devices.forget(7).unwrap();
 }
-
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn protocol_close_joins_started_retirement_and_still_replies() {
@@ -124,7 +112,7 @@ async fn protocol_close_joins_started_retirement_and_still_replies() {
     let number = i32::from_ne_bytes(output.bytes[4..8].try_into().unwrap());
     drop(output);
     devices.retire_inputs(7);
-    devices.retry();
+    devices.settle_retired();
     assert!(devices.connections[&7].slots[&number].running);
     let (done, receiver) = oneshot::channel();
     assert!(devices.close(7, number, done).is_none());
@@ -137,7 +125,6 @@ async fn protocol_close_joins_started_retirement_and_still_replies() {
     assert!(!devices.pending(7));
     devices.forget(7).unwrap();
 }
-
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn duplicate_open_reuses_slot_until_last_close_then_allocates_fresh_slot() {
@@ -163,6 +150,28 @@ async fn duplicate_open_reuses_slot_until_last_close_then_allocates_fresh_slot()
         number
     );
     drop(third);
+    let owner = devices.owner(7).unwrap();
+    devices.begin_cleanup(7);
+    assert!(devices.resources.close_owner(owner).is_empty());
+    devices.cleaned(7);
+    devices.forget(7).unwrap();
+}
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn registered_work_is_visible_but_cannot_enter_kernel_before_guard_release() {
+    let mut devices = fixture(1);
+    devices.register(7).unwrap();
+    let (release, wait) = oneshot::channel();
+    let (done, _) = oneshot::channel();
+    assert!(devices.open(7, admission(), wait, true, done).is_none());
+    assert!(devices.running(7));
+    assert!(devices.forget(7).is_err());
+    tokio::task::yield_now().await;
+    assert_eq!(devices.resources.pending(), 0);
+    release.send(()).unwrap();
+    let output = acknowledge(devices.next_completion().await.unwrap());
+    assert_eq!(opcode(&output), wire::SERVER_DEVICE_OPENED);
+    drop(output);
     let owner = devices.owner(7).unwrap();
     devices.begin_cleanup(7);
     assert!(devices.resources.close_owner(owner).is_empty());

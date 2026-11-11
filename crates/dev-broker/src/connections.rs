@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::io;
 use std::ops::Index;
 use tokio::sync::oneshot;
-use tokio::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Membership {
@@ -36,7 +35,6 @@ pub struct Connection {
     pub closing: bool,
     pub cleanup: bool,
     pub cleanup_running: bool,
-    pub retry: Instant,
     pub error: String,
     port: Port,
     enabled_tag: Option<u64>,
@@ -85,7 +83,6 @@ impl<K: Copy + Ord> Connections<K> {
                 closing: false,
                 cleanup: false,
                 cleanup_running: false,
-                retry: Instant::now(),
                 error: String::new(),
                 port,
                 enabled_tag: None,
@@ -93,6 +90,14 @@ impl<K: Copy + Ord> Connections<K> {
             },
         );
         close
+    }
+    pub fn keys(&self) -> impl Iterator<Item = K> + '_ {
+        self.entries.keys().copied()
+    }
+    pub fn enable_delivered(&self, key: K) -> bool {
+        self.entries
+            .get(&key)
+            .is_some_and(|entry| entry.enabled_tag.is_none())
     }
     pub fn get(&self, key: &K) -> Option<&Connection> {
         self.entries.get(key)
@@ -111,6 +116,7 @@ impl<K: Copy + Ord> Connections<K> {
     pub fn send(&self, key: K, bytes: Vec<u8>, tag: Option<u64>) -> bool {
         self.entries.get(&key).is_some_and(|entry| {
             entry.send(Output {
+                permission: None,
                 bytes,
                 fd: None,
                 tag,
@@ -252,7 +258,6 @@ impl<K: Copy + Ord> Connections<K> {
         entry.cleanup_running = false;
         if let Some(error) = error {
             entry.error = error;
-            entry.retry = Instant::now() + Duration::from_secs(1);
             false
         } else {
             entry.cleanup = false;

@@ -1,13 +1,11 @@
-pub mod acl;
 pub mod application;
 pub mod authority;
+pub mod catalog;
 pub mod daemon;
 pub mod dbus;
-pub use dev_broker::{device, seatd};
+pub mod discovery;
+pub mod fatal;
 pub mod instance;
-pub mod registry;
-pub mod resources;
 pub mod seat;
-pub mod topology;
-pub mod topology_transaction;
-pub mod vt;
+pub mod sources;
+pub use dev_broker::{device, seatd};

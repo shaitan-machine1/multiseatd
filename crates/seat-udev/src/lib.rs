@@ -11,5 +11,7 @@ mod seat;
 pub mod assign;
 
 pub use model::{DeviceKind, Event, Filter, Model, SeatDevice};
-pub use real::{Context, Error};
+pub use real::{Context, Error, PhysicalHint, PhysicalMonitor, ResolvedDevice, resolve_current};
+#[cfg(feature = "assign")]
+pub use real::{InventoryScan, fresh_inventory};
 pub use seat::{SeatName, SeatNameError};

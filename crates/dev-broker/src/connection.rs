@@ -27,6 +27,7 @@ pub enum Event<K> {
 }
 
 pub struct Output {
+    pub permission: Option<crate::permit::Permit>,
     pub bytes: Vec<u8>,
     pub fd: Option<OwnedFd>,
     pub tag: Option<u64>,
@@ -141,12 +142,24 @@ pub async fn run<K: Copy + Send + 'static>(
         // Output queue order is also the order of protocol replies and enable/
         // disable notifications; OPENED can never be overtaken by ENABLE.
         if let Ok(next) = output.try_recv() {
-            connection.queue(next.bytes, next.fd)?;
+            connection.queue_checked(next.bytes, next.fd, next.permission)?;
             if let Some(quota) = next.quota {
                 quotas.push(quota);
             }
             if let Some(tag) = next.tag {
                 tags.push_back(tag);
+            }
+            continue;
+        }
+        if pending.is_some()
+            && connection.can_process_input()
+            && let Some(packet) = connection.take_disable_ack()?
+        {
+            let (done, _completed) = oneshot::channel();
+            tokio::select! {
+                biased;
+                _ = closing(&mut closed) => return Ok(()),
+                sent = requests.send(Request { connection: id, packet, done }) => if sent.is_err() { return Ok(()) },
             }
             continue;
         }
@@ -197,7 +210,7 @@ pub async fn run<K: Copy + Send + 'static>(
             }
             next = output.recv() => {
                 let Some(next) = next else { return Ok(()) };
-                connection.queue(next.bytes, next.fd)?;
+                connection.queue_checked(next.bytes, next.fd, next.permission)?;
                 if let Some(quota) = next.quota { quotas.push(quota); }
                 if let Some(tag) = next.tag { tags.push_back(tag); }
             }
@@ -217,5 +230,50 @@ pub async fn run<K: Copy + Send + 'static>(
                 ready.clear_ready();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::seatd::protocol as wire;
+    use std::{io::Write, os::unix::net::UnixStream, time::Duration};
+    #[tokio::test]
+    async fn disable_ack_overtakes_unadmitted_policy_wait_without_reordering_normal_requests() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (port, output, closed) = channel();
+        let (requests, mut incoming) = mpsc::channel(8);
+        let (events, _deliveries) = mpsc::channel(8);
+        let transport = tokio::spawn(run(1u64, server.into(), output, closed, requests, events));
+        client
+            .write_all(&wire::packet(wire::CLIENT_OPEN_DEVICE, b"pending").unwrap())
+            .unwrap();
+        let open = incoming.recv().await.unwrap();
+        assert_eq!(open.packet.opcode, wire::CLIENT_OPEN_DEVICE);
+        // Simulate a parent-owned admission read waiting behind a writer.
+        client.write_all(&wire::empty(wire::CLIENT_PING)).unwrap();
+        client
+            .write_all(&wire::empty(wire::CLIENT_DISABLE_SEAT))
+            .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(1), incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ack.packet.opcode, wire::CLIENT_DISABLE_SEAT);
+        let _ = ack.done.send(());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), incoming.recv())
+                .await
+                .is_err()
+        );
+        open.done.send(()).unwrap();
+        let ping = tokio::time::timeout(Duration::from_secs(1), incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ping.packet.opcode, wire::CLIENT_PING);
+        let _ = ping.done.send(());
+        port.close.signal();
+        transport.await.unwrap().unwrap();
     }
 }

@@ -5,18 +5,16 @@
 //! runtime. Originals remain in Resources through failure, cancellation/unwind.
 use crate::connection::Output;
 use crate::device::{AllowedDevice, DeviceKind};
-use crate::inventory::Inventory;
 use crate::permit::Permit;
 use crate::resources::{ConnectionKey, HandleId, Resources};
 use crate::seatd::protocol as wire;
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
-use tokio::time::{Duration, Instant};
 
 struct Slot {
     device: AllowedDevice,
@@ -26,7 +24,7 @@ struct Slot {
     closed: bool,
     running: bool,
     waiter: Option<oneshot::Sender<()>>,
-    retry: Instant,
+    failed: bool,
 }
 struct Slots {
     owner: ConnectionKey,
@@ -69,6 +67,7 @@ pub struct Reply<K> {
     pub done: Option<oneshot::Sender<()>>,
     pub error: Option<String>,
     pub disconnect: bool,
+    pub publication: Option<(i32, Permit)>,
 }
 impl<K> Reply<K> {
     fn new(connection: K, owner: ConnectionKey, done: Option<oneshot::Sender<()>>) -> Self {
@@ -79,10 +78,12 @@ impl<K> Reply<K> {
             done,
             error: None,
             disconnect: false,
+            publication: None,
         }
     }
     fn bytes(&mut self, bytes: Vec<u8>) {
         self.output = Some(Output {
+            permission: None,
             bytes,
             fd: None,
             tag: None,
@@ -93,7 +94,6 @@ impl<K> Reply<K> {
 
 pub struct Devices<K> {
     connections: BTreeMap<K, Slots>,
-    inventory: Inventory,
     jobs: JoinSet<Completion<K>>,
     resources: Arc<Resources>,
     workers: Arc<Semaphore>,
@@ -110,7 +110,6 @@ impl<K: Copy + Ord + Send + 'static> Devices<K> {
         assert!(limit > 0);
         Self {
             connections: BTreeMap::new(),
-            inventory: Inventory::new(),
             jobs: JoinSet::new(),
             resources,
             workers,
@@ -138,9 +137,6 @@ impl<K: Copy + Ord + Send + 'static> Devices<K> {
     }
     pub fn owner(&self, key: K) -> Option<ConnectionKey> {
         self.connections.get(&key).map(|slots| slots.owner)
-    }
-    pub fn replace_inventory(&mut self, devices: impl IntoIterator<Item = AllowedDevice>) {
-        self.inventory.replace(devices);
     }
     pub fn has_jobs(&self) -> bool {
         !self.jobs.is_empty()
@@ -204,8 +200,8 @@ impl<K: Copy + Ord + Send + 'static> Devices<K> {
     pub fn open(
         &mut self,
         key: K,
-        path: &Path,
-        access: &Permit,
+        admission: Option<(AllowedDevice, Permit)>,
+        start: oneshot::Receiver<()>,
         synthetic: bool,
         done: oneshot::Sender<()>,
     ) -> Option<Reply<K>> {
@@ -215,10 +211,8 @@ impl<K: Copy + Ord + Send + 'static> Devices<K> {
             denied.bytes(wire::error(libc::EBUSY));
             return Some(denied);
         }
-        let Some((device, permit)) = self
-            .inventory
-            .authorize(path, access)
-            .filter(|_| !client.cleaning)
+        let Some((device, permit)) =
+            admission.filter(|(_, permit)| permit.is_open() && !client.cleaning)
         else {
             denied.bytes(wire::error(libc::EACCES));
             return Some(denied);
@@ -245,9 +239,12 @@ impl<K: Copy + Ord + Send + 'static> Devices<K> {
         client.operations += 1;
         client.protocol_busy = true;
         self.jobs.spawn(async move {
+            // Registration is already visible to withdrawal. Kernel work may
+            // start only after the caller has released its admission guard.
+            let started = start.await.is_ok();
             let operation = tokio::task::spawn_blocking(move || {
                 let _worker = worker;
-                if !permit.is_open() {
+                if !started || !permit.is_open() {
                     return Operation::Denied(libc::EACCES);
                 }
                 let existing = slots.iter().find(|(_, previous, _)| previous == &device);
@@ -286,6 +283,20 @@ impl<K: Copy + Ord + Send + 'static> Devices<K> {
             }
         });
         None
+    }
+    /// Balance an opened result whose FD was never published. Originals remain
+    /// owned and are closed by normal retired-slot settlement.
+    pub fn unpublished(&mut self, key: K, number: i32) {
+        if let Some(slot) = self
+            .connections
+            .get_mut(&key)
+            .and_then(|slots| slots.slots.get_mut(&number))
+        {
+            slot.references = slot.references.saturating_sub(1);
+            if slot.references == 0 {
+                slot.retired = true;
+            }
+        }
     }
     pub fn close(&mut self, key: K, number: i32, done: oneshot::Sender<()>) -> Option<Reply<K>> {
         let client = self.connections.get_mut(&key).expect("connection slots");
@@ -362,7 +373,8 @@ impl<K: Copy + Ord + Send + 'static> Devices<K> {
         });
         None
     }
-    pub fn retry(&mut self) {
+    /// Start each retired-slot close once. Failure is reported for fatal handling.
+    pub fn settle_retired(&mut self) {
         let pending: Vec<_> = self
             .connections
             .iter()
@@ -372,10 +384,7 @@ impl<K: Copy + Ord + Send + 'static> Devices<K> {
                     .slots
                     .iter()
                     .filter(|(_, slot)| {
-                        slot.retired
-                            && !slot.closed
-                            && !slot.running
-                            && slot.retry <= Instant::now()
+                        slot.retired && !slot.closed && !slot.running && !slot.failed
                     })
                     .map(|(number, _)| (*key, *number))
                     .collect::<Vec<_>>()
@@ -425,7 +434,7 @@ impl<K: Copy + Ord + Send + 'static> Devices<K> {
                             closed: false,
                             running: false,
                             waiter: None,
-                            retry: Instant::now(),
+                            failed: false,
                         },
                     );
                 }
@@ -442,7 +451,9 @@ impl<K: Copy + Ord + Send + 'static> Devices<K> {
                         if let Some(references) = entry.references.checked_add(1) {
                             entry.references = references;
                             entry.retired = false;
+                            reply.publication = Some((slot, permit.clone()));
                             reply.output = Some(Output {
+                                permission: Some(permit),
                                 bytes: wire::device_opened(slot),
                                 fd: Some(fd),
                                 tag: None,
@@ -472,7 +483,9 @@ impl<K: Copy + Ord + Send + 'static> Devices<K> {
                             }
                         }
                         Err(error) => {
-                            entry.retry = Instant::now() + Duration::from_secs(1);
+                            // The caller must fail-stop; never schedule a
+                            // normal-service retry of required withdrawal.
+                            entry.failed = true;
                             reply.error = Some(error.to_string());
                             if reply.done.is_some() {
                                 reply.bytes(wire::error(errno(&error)));

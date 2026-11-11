@@ -73,6 +73,30 @@ impl Decoder {
         Ok(Some(Packet { opcode, payload }))
     }
 
+    /// Disable ACKs are out-of-band progress, including while an earlier open
+    /// is waiting for policy admission. Preserve every other request's order.
+    pub fn take_disable_ack(&mut self) -> Result<Option<Packet>, DecodeError> {
+        let mut offset = 0;
+        while self.bytes.len().saturating_sub(offset) >= 4 {
+            let opcode = u16::from_ne_bytes([self.bytes[offset], self.bytes[offset + 1]]);
+            let length =
+                u16::from_ne_bytes([self.bytes[offset + 2], self.bytes[offset + 3]]) as usize;
+            if length > MAX_PAYLOAD_LEN {
+                return Err(DecodeError::PayloadTooLarge(length));
+            }
+            let end = offset + 4 + length;
+            if end > self.bytes.len() {
+                return Ok(None);
+            }
+            if opcode == CLIENT_DISABLE_SEAT {
+                let payload = self.bytes[offset + 4..end].to_vec();
+                self.bytes.drain(offset..end);
+                return Ok(Some(Packet { opcode, payload }));
+            }
+            offset = end;
+        }
+        Ok(None)
+    }
     pub fn pending(&self) -> usize {
         self.bytes.len()
     }

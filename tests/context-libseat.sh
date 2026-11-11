@@ -15,8 +15,9 @@ set -e
 work=$(mktemp -d /tmp/context-libseat.XXXXXX)
 trap 'rm -rf "$work"' EXIT
 chmod 755 "$work"
-meson setup "$work/build" "$source_repo" -Dserver=disabled -Dexamples=disabled -Dman-pages=disabled -Dlibseat-logind=disabled -Dlibseat-builtin=disabled >/dev/null
+meson setup "$work/build" "$source_repo" -Dserver=disabled -Dexamples=disabled -Dman-pages=disabled -Dlibseat-logind=disabled -Dlibseat-builtin=disabled -Dlibseat-multiseatd=enabled >/dev/null
 ninja -C "$work/build" >/dev/null
 cc -Wall -Wextra -Werror "$repo/tests/fixtures/context-libseat.c" -I"$source_repo/include" -L"$work/build" -Wl,-rpath,"$work/build" -lseat -o "$work/client"
-CONTEXT_LIBSEAT_CLIENT="$work/client" "$repo/tests/root-context-control.sh"
+cc -Wall -Wextra -Werror "$repo/tests/fixtures/context-native.c" -I"$source_repo/include" -L"$work/build" -Wl,-rpath,"$work/build" -lseat -o "$work/native-client"
+CONTEXT_LIBSEAT_CLIENT="$work/client" CONTEXT_NATIVE_CLIENT="$work/native-client" "$repo/tests/root-context-control.sh"
 echo 'Maintained C libseat inherited-FD and sequential close/reopen passed against the context daemon'

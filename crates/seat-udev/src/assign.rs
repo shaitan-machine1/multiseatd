@@ -408,11 +408,7 @@ fn property(device: &Device, name: &str) -> Option<String> {
 }
 
 fn has_tag(device: &Device, wanted: &str) -> bool {
-    ["CURRENT_TAGS", "TAGS"].into_iter().any(|name| {
-        property(device, name)
-            .map(|tags| tags.split(':').any(|tag| tag == wanted))
-            .unwrap_or(false)
-    })
+    crate::real::has_tag(device, wanted)
 }
 
 fn validate_stable_id(value: &str) -> Result<(), AssignmentError> {

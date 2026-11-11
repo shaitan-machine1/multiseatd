@@ -4,12 +4,14 @@ members = [
   "crates/lib-multiseatd",
   "crates/multiseatd",
   "crates/dev-broker",
+  "crates/dev-acl",
+  "crates/linux-vt",
   "crates/seat-launch",
   "crates/seat-udev",
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "GPL-3.0-only"
 rust-version = "1.88"
@@ -18,7 +20,10 @@ rust-version = "1.88"
 clap = { version = "4.5", features = ["derive"] }
 dbus = "0.9.12"
 dev-broker = { path = "crates/dev-broker" }
+dev-acl = { path = "crates/dev-acl" }
 hex = "0.4"
+futures-util = "=0.3.34"
+linux-vt = { path = "crates/linux-vt" }
 libc = "0.2"
 lib-multiseatd = { path = "crates/lib-multiseatd" }
 nix = { version = "0.31", features = ["event", "fs", "ioctl", "poll", "process", "signal", "socket", "time", "uio", "user"] }
@@ -30,4 +35,4 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "sync", "tim
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 udev = "0.9.3"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }

@@ -17,6 +17,7 @@ pub enum ReadStatus {
 }
 
 struct Outbound {
+    permission: Option<crate::permit::Permit>,
     bytes: Vec<u8>,
     offset: usize,
     fd: Option<OwnedFd>,
@@ -101,6 +102,9 @@ impl Connection {
         Ok(ReadStatus::Progress)
     }
 
+    pub fn take_disable_ack(&mut self) -> io::Result<Option<Packet>> {
+        self.decoder.take_disable_ack().map_err(decode_to_io)
+    }
     pub fn next_packet(&mut self) -> io::Result<Option<Packet>> {
         self.decoder.decode_next().map_err(decode_to_io)
     }
@@ -114,6 +118,14 @@ impl Connection {
     }
 
     pub fn queue(&mut self, bytes: Vec<u8>, fd: Option<OwnedFd>) -> io::Result<()> {
+        self.queue_checked(bytes, fd, None)
+    }
+    pub fn queue_checked(
+        &mut self,
+        bytes: Vec<u8>,
+        fd: Option<OwnedFd>,
+        permission: Option<crate::permit::Permit>,
+    ) -> io::Result<()> {
         if self.outgoing.len() >= MAX_OUTBOUND_MESSAGES {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
@@ -121,6 +133,7 @@ impl Connection {
             ));
         }
         self.outgoing.push_back(Outbound {
+            permission,
             bytes,
             offset: 0,
             fd,
@@ -130,6 +143,14 @@ impl Connection {
 
     pub fn flush(&mut self) -> io::Result<bool> {
         while let Some(outbound) = self.outgoing.front_mut() {
+            if outbound.fd.is_some()
+                && outbound
+                    .permission
+                    .as_ref()
+                    .is_some_and(|permit| !permit.is_open())
+            {
+                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            }
             let iov = [IoSlice::new(&outbound.bytes[outbound.offset..])];
             let sent = if let Some(fd) = outbound.fd.as_ref() {
                 let fds = [fd.as_raw_fd()];

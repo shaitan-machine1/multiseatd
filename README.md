@@ -1,62 +1,63 @@
 # multiseatd
 
-Capability-authorized seat contexts, independent C libseat/seatd connections and
-explicit UID access grants. Installable pieces are `multiseatd`, `seat-udev`,
-`lib-multiseatd` (Rust library `libmultiseatd`) and the `seat-launch` exec wrapper.
+Per-seat context policy, native C libseat transports and explicit device ACL
+access. Each independently configured daemon owns one seat. There is no global
+controller, peer discovery, automatic takeover or compatibility API.
 
-The incompatible v2 API replaces the former client-lease interface. No old bus
-name, compatibility adapter or separate server daemon remains. Seat-launch is
-the fresh-connection exec wrapper, not the retired per-client launcher API.
-See [API](docs/API.md) and [behavior/security limits](docs/BEHAVIOR.md).
-
-The per-seat rewrite is in progress: the CLI/API below still describe the global
-v2 implementation. The five-crate workspace now includes context-unaware
-`dev-broker` kernel/framing/descriptor primitives, retained broker resources and
-the authoritative authorization inventory, connection membership/transport
-state, device slots and bounded kernel-job scheduling, separate from daemon-owned
-ACLs. The controller retains context associations and drives the server runtime;
-the per-seat control-plane migration is not yet complete.
+The seven crates are `multiseatd`, `lib-multiseatd` (Rust `libmultiseatd`),
+`dev-broker`, `dev-acl`, `linux-vt`, `seat-udev` and `seat-launch`.
+[API](docs/API.md) · [behavior and limits](docs/BEHAVIOR.md).
 
 ## Operation
 
-Multiseatd must run as root. Configure seat0's single graphical terminal explicitly:
+Run as root. Build non-VT and VT executables separately:
 
 ```sh
-multiseatd --graphical-vt 7
+cargo build --release --workspace --target-dir target/no-vt
+cargo build --release -p multiseatd --features vt --target-dir target/vt
+# Install target/no-vt/release/multiseatd as /usr/bin/multiseatd,
+# target/vt/release/multiseatd as /usr/bin/multiseatd-vt.
+multiseatd --seat seat1
+multiseatd-vt --seat seat0 --vts 7,8,9,10,11,12
 ```
 
-Coordinate the terminal with gettys/display managers first. The configured VT,
-`/dev/tty0` and `/dev/console` must be root-owned without group/other access; the
-daemon rejects conflicting ownership. It does not chmod nodes or seize terminals.
-`--non-vt-only` explicitly leaves seat0 unmanaged and conflicts with graphical VT
-configuration. Other seats do not use Linux VTs. The persistent singleton inode
-is `/run/multiseatd.lock` and is never unlinked by the daemon.
+Coordinate the complete reserved terminal set with gettys/other display managers
+first; preserve a recovery terminal outside it. Nodes must already have safe
+ownership/modes. The daemon never chmods nodes or seizes occupied terminals.
+The non-VT executable has no VT options, signal ownership or linux-vt dependency.
+Install `dist/dbus/org.SGLogin.Multiseatd1.conf` as system-bus policy. Per-seat
+locks are retained through cleanup; locked inodes are never unlinked.
 
-Topology is monitored continuously. Context creation is root-only; possession of
-a returned Unix FD authorizes full control of that one context. Contexts begin
-inactive, and transport arrival/EOF never selects a context. UID grants are
-explicit context registrations, not inferred from process/session/connection UID.
+Finish assignments before destination startup. Live assignment changes require
+explicit removal on **every configured seat**, then addition on all seats; use
+loginctl and its explicit participant configuration. Hotplug does not adopt new
+assignments and CHANGE events do not refresh policy.
 
-Trusted graphical launch code drops credentials/PAM and detaches/sanitizes its
-lineage. At the final compositor exec boundary it delegates authority explicitly:
+Root creates a context with immutable VT binding, adds explicit final-UID grants,
+and activates its ID. Contexts start inactive. An occupied VT (including the same
+context) returns Busy; activation never replaces another context. Only the active
+foreground context is effective. Non-VT seats have one active association.
+Authority/connection EOF never selects a successor.
+
+Trusted launch code performs PAM, credential changes and detachment. At the final
+compositor exec boundary it explicitly delegates authority:
 
 ```sh
-MULTISEATD_AUTHORITY_FD=3 /usr/libexec/multiseatd/seat-launch /usr/bin/weston
+MULTISEATD_AUTHORITY_FD=3 /usr/libexec/multiseatd/seat-launch --seat seat0 /usr/bin/weston
 ```
 
-FD 3 must really be inherited from an authorized controller; the number/environment
-is not authentication. Seat-launch obtains a fresh connection, sets seat/VT metadata
-from the daemon, closes authority/unlisted FDs and execs. It does not activate,
-perform PAM, change credentials or create a session supervisor. Ordinary programs
-receive only the intended seatd endpoint, not full authority or a Linux VT.
-Never pass authority through untrusted scripts or environment-controlled loaders.
+FD 3 must actually be inherited from the privileged host. Seat-launch obtains a
+fresh connection, verifies immutable metadata, closes authority/unlisted FDs and
+execs. It never activates, performs PAM or changes credentials. Ordinary programs
+receive neither context authority nor a Linux controlling terminal. Do not pass
+authority through untrusted scripts/loaders.
 
-## Build and test
+## Build and validation
 
-Requires Rust 1.88+, libudev, libdbus and libacl development files.
+Requires Rust 1.88+, libudev, libdbus and libacl development files; system-bus policy
+requires support for `send_destination_prefix` (D-Bus 1.16 supports it).
 
 ```sh
-cargo build --workspace
 cargo fmt --all -- --check
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
@@ -67,15 +68,15 @@ tests/root-context-control.sh
 tests/context-libseat.sh
 ```
 
-Run build harnesses as a normal user. Root harnesses require passwordless sudo,
-create a private bus/disposable fixtures, and return 77 for missing prerequisites.
-They never change host PAM/services/udev/VTs or production device ACLs. The C
-harness fetches the exact maintained libseat revision recorded in
-`tests/libseat-source.sh`; `LIBSEAT_REPO` supplies an explicit alternative checkout.
-There is no implicit checkout-layout dependency.
+Build as a normal user. Root harnesses use passwordless sudo, private buses and
+disposable fixtures; missing prerequisites return 77 (skip). They never alter
+host services, PAM, udev, real terminals or production device ACLs. The C harness
+fetches the exact maintained libseat revision in `tests/libseat-source.sh`;
+`LIBSEAT_REPO` explicitly selects an alternative checkout. `TEST_ACL_FAULT=error`,
+`panic` or `stall` selects post-write fault validation in the root contract harness.
 
-`test-support` only enables explicit synthetic fixtures; /dev/null is not evidence
-of real driver revocation. Fake VT and exec fixtures are not authenticated graphical
-login or physical-hardware acceptance. The session/client libraries and wrapper
-remain synchronous and executor-free. Tokio is server-only: the daemon drives
-its broker transport futures on its own runtime; no library constructs one.
+`test-support` enables only explicit synthetic fixtures. A /dev/null stand-in is
+not real device revocation; model VT tests are not native terminal or graphical
+login acceptance. SDK/session clients and launcher are synchronous and create no
+runtime/worker thread. The daemon drives broker/ACL futures on its runtime;
+linux-vt owns only native mechanics and creates no executor.

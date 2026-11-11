@@ -155,8 +155,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev-acl"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "dev-broker"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "nix",
@@ -184,10 +193,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "futures-channel"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d"
+dependencies = [
+ "futures-core",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
+
+[[package]]
+name = "futures-macro"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
 
 [[package]]
 name = "futures-task"
@@ -202,6 +231,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
+ "futures-macro",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -272,7 +302,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lib-multiseatd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dbus",
  "libc",
@@ -309,6 +339,15 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "linux-vt"
+version = "0.4.0"
+dependencies = [
+ "futures-channel",
+ "libc",
+ "nix",
+]
 
 [[package]]
 name = "log"
@@ -353,14 +392,17 @@ dependencies = [
 
 [[package]]
 name = "multiseatd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "dbus",
+ "dev-acl",
  "dev-broker",
+ "futures-util",
  "hex",
  "lib-multiseatd",
  "libc",
+ "linux-vt",
  "nix",
  "rustix",
  "seat-udev",
@@ -480,7 +522,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "seat-launch"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "lib-multiseatd",
@@ -489,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "seat-udev"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "nix",

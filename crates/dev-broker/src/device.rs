@@ -35,7 +35,7 @@ pub enum DeviceKind {
     Hidraw,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AllowedDevice {
     pub id: DeviceId,
     pub path: PathBuf,
@@ -43,7 +43,20 @@ pub struct AllowedDevice {
     pub kind: DeviceKind,
     filesystem: u64,
     inode: u64,
+    // Prevent inode-number reuse while any catalog/job description survives.
+    _identity_pin: std::sync::Arc<fs::File>,
 }
+impl PartialEq for AllowedDevice {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.path == other.path
+            && self.device_number == other.device_number
+            && self.kind == other.kind
+            && self.filesystem == other.filesystem
+            && self.inode == other.inode
+    }
+}
+impl Eq for AllowedDevice {}
 
 impl AllowedDevice {
     pub fn same_inode(&self, expected: (u64, u64)) -> bool {
@@ -55,9 +68,16 @@ impl AllowedDevice {
         device_number: u64,
         kind: DeviceKind,
     ) -> io::Result<Self> {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let path = fs::canonicalize(path)?;
-        let metadata = fs::metadata(&path)?;
+        let pin = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        let metadata = pin.metadata()?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
         Ok(Self {
             id,
             path,
@@ -65,6 +85,7 @@ impl AllowedDevice {
             kind,
             filesystem: metadata.dev(),
             inode: metadata.ino(),
+            _identity_pin: std::sync::Arc::new(pin),
         })
     }
 }

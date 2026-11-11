@@ -1,1204 +1,1414 @@
-//! One serialized controller per seat. Context selection never follows socket
-//! arrival/EOF; independent transports share only their context's policy.
-
-mod broker;
-pub mod connection;
-mod grants;
-pub mod policy;
-mod terminal;
-mod work;
-
-use crate::daemon::{Shutdown, ShutdownPhase};
-use crate::registry::Registration;
-use crate::resources::{ConnectionKey, Permit, Resources};
-use crate::seatd::protocol as wire;
-use dev_broker::connections::{Connections, Membership};
-use libmultiseatd::contract::{ConnectionRow, ContextRow, ErrorKind, SeatRow};
-use libmultiseatd::{ConnectionId, ContextId};
-use seat_udev::SeatName;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+//! Parent-owned callable seat. One State lock owns policy, catalog and ACL effects.
+#[cfg(all(test, not(feature = "vt")))]
+mod tests;
+#[cfg(all(test, feature = "vt", feature = "test-support"))]
+mod vt_tests;
+use crate::{
+    authority::{Authorities, AuthorityError, Registration},
+    catalog::{DeviceCatalog, NODE_LIMIT},
+    discovery::{self, Snapshot},
+    fatal::{Budget, Error, Fatal, Result},
+};
+use dev_acl::AclRegistry;
+use dev_broker::{broker, connection, permit::Permit, resources::ConnectionKey};
+use libmultiseatd::{ContextId, ContextInfo, ErrorKind};
+use seat_udev::{PhysicalHint, SeatName};
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::ops::{Deref, DerefMut};
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
-use tokio::task::JoinSet;
-use tokio::time::{Duration, Instant, interval};
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, watch};
+use tokio::time::{Instant, timeout_at};
 
-type Reply = oneshot::Sender<Result<(), ErrorKind>>;
-
-pub enum Command {
-    Stop,
-    PreparePolicy {
-        policy: policy::Policy,
-        reply: Reply,
-    },
-    CommitPolicy,
-    Grant {
-        context: ContextId,
-        uid: u32,
-        grant: bool,
-        reply: Reply,
-    },
-    Register {
-        context: ContextId,
-        lifetime: Registration,
-        reply: Reply,
-    },
-    Remove {
-        context: ContextId,
-        reply: Reply,
-    },
-    Activate {
-        context: ContextId,
-        reply: Reply,
-    },
-    Deactivate {
-        context: ContextId,
-        reply: Reply,
-    },
-    CreateConnection {
-        context: ContextId,
-        reply: oneshot::Sender<Result<ConnectionPublication, ErrorKind>>,
-    },
-    RemoveConnection {
-        context: ContextId,
-        connection: ConnectionId,
-        reply: Reply,
-    },
-}
-
-#[derive(Clone)]
-pub struct Budget {
-    connections: Arc<Semaphore>,
-    workers: Arc<Semaphore>,
-    acl_workers: Arc<Semaphore>,
-    descriptors: Arc<Semaphore>,
-}
-impl Default for Budget {
-    fn default() -> Self {
-        Self {
-            connections: Arc::new(Semaphore::new(4096)),
-            // Match the runtime's four blocking threads without allowing
-            // broker I/O to consume the ACL lane.
-            workers: Arc::new(Semaphore::new(3)),
-            acl_workers: Arc::new(Semaphore::new(1)),
-            descriptors: Arc::new(Semaphore::new(1024)),
-        }
-    }
-}
-
-#[derive(Clone, Eq, PartialEq)]
-pub struct Status {
-    pub seat: SeatRow,
-    pub contexts: BTreeMap<ContextId, ContextRow>,
-    pub connections: BTreeMap<ConnectionId, ConnectionRow>,
-}
-
-#[derive(Clone)]
-pub struct Port {
-    commands: mpsc::Sender<Command>,
-    pub status: watch::Receiver<Status>,
-    policy_gate: watch::Sender<Permit>,
-}
-impl Port {
-    pub async fn prepare_policy(
-        &self,
-        policy: policy::Policy,
-    ) -> Result<oneshot::Receiver<Result<(), ErrorKind>>, ErrorKind> {
-        self.policy_gate.borrow().fence();
-        let (reply, receiver) = oneshot::channel();
-        self.commands
-            .send(Command::PreparePolicy { policy, reply })
-            .await
-            .map_err(|_| ErrorKind::BackendFailure)?;
-        Ok(receiver)
-    }
-    pub async fn commit_policy(&self) -> Result<(), ErrorKind> {
-        self.commands
-            .send(Command::CommitPolicy)
-            .await
-            .map_err(|_| ErrorKind::BackendFailure)
-    }
-    pub fn send(&self, command: Command) -> Result<(), ErrorKind> {
-        self.commands
-            .try_send(command)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ErrorKind::LimitExceeded,
-                mpsc::error::TrySendError::Closed(_) => ErrorKind::BackendFailure,
-            })
-    }
-}
-
-pub struct ConnectionPublication {
-    id: ConnectionId,
-    #[cfg(test)]
-    resource_owner: ConnectionKey,
-    fd: Option<OwnedFd>,
+const CONTEXT_LIMIT: usize = 128;
+const CONNECTION_LIMIT: usize = 64;
+struct Connection {
+    handle: u32,
     close: connection::Close,
-    lifetime: Registration,
-    committed: bool,
 }
-impl ConnectionPublication {
-    pub fn id(&self) -> ConnectionId {
-        self.id
-    }
-    pub fn publish<T>(
-        mut self,
-        send: impl FnOnce(ConnectionId, OwnedFd) -> io::Result<T>,
-    ) -> io::Result<T> {
-        if self.committed || !self.lifetime.is_live() || self.close.is_closed() {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-        let fd = self
-            .fd
-            .take()
-            .ok_or_else(|| io::Error::other("connection endpoint already consumed"))?;
-        let result = send(self.id, fd)?;
-        self.committed = true;
-        Ok(result)
-    }
-}
-impl Drop for ConnectionPublication {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.close.signal();
-        }
-    }
-}
-
-struct ContextState {
+struct Context {
+    #[cfg(feature = "vt")]
+    vt: u32,
     grants: BTreeSet<u32>,
+    connections: BTreeMap<ConnectionKey, Connection>,
     lifetime: Registration,
-    phase: &'static str,
-    connections: BTreeSet<ConnectionId>,
-    epoch: Option<Permit>,
-    dirty: bool,
-    revoking: bool,
-    preparing: bool,
-    prepared: bool,
-    removing: bool,
-    retry: Instant,
-    error: String,
-    removed: Vec<Reply>,
 }
-
-// Policy association only. Transport membership, epochs and teardown state
-// are owned by dev-broker, not mirrored in this context binding.
-struct Binding {
-    operations: usize,
+struct Applied {
     context: ContextId,
-    removed: Vec<Reply>,
-    _quota: OwnedSemaphorePermit,
+    permission: Permit,
 }
-
-struct Mutation {
-    grant: Option<(u32, bool)>,
+#[cfg(feature = "vt")]
+struct Foreground {
+    observed: Option<u32>,
+    available: bool,
+}
+#[cfg(feature = "vt")]
+struct ForegroundWait {
     context: ContextId,
-    activate: bool,
-    reply: Reply,
-}
-struct Transition {
-    requested: ContextId,
-    activate: bool,
-    target: Option<ContextId>,
-    withdrawing: BTreeSet<ContextId>,
-    pending_disable: BTreeSet<ConnectionId>,
-    pending_enable: BTreeSet<ConnectionId>,
     deadline: Instant,
-    enabling: bool,
-    replies: Vec<Reply>,
-    failure: Option<ErrorKind>,
+    alive: Arc<std::sync::atomic::AtomicBool>,
+    started: Arc<std::sync::atomic::AtomicBool>,
 }
-
-#[derive(Clone, Copy)]
-enum Job {
-    Revoke(ContextId),
-    Prepare(ContextId),
-    Close(ConnectionId),
-    Access(ContextId),
-    IdleAccess,
+#[cfg(feature = "vt")]
+struct WaitLifetime(Arc<std::sync::atomic::AtomicBool>);
+#[cfg(feature = "vt")]
+impl Drop for WaitLifetime {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
-struct Completion {
-    job: Job,
-    error: Option<String>,
+struct State {
+    catalog: DeviceCatalog,
+    acl: AclRegistry,
+    authorities: Authorities,
+    contexts: BTreeMap<ContextId, Context>,
+    applied: Option<Applied>,
+    sequence: u64,
+    #[cfg(not(feature = "vt"))]
+    active: Option<ContextId>,
+    #[cfg(feature = "vt")]
+    active: BTreeMap<u32, ContextId>,
+    #[cfg(feature = "vt")]
+    foreground: Foreground,
+    #[cfg(feature = "vt")]
+    foreground_waits: Vec<ForegroundWait>,
 }
-
-pub struct Controller {
+pub struct Seat {
     name: SeatName,
-    commands: mpsc::Receiver<Command>,
-    status: watch::Sender<Status>,
-    contexts: BTreeMap<ContextId, ContextState>,
-    clients: BTreeMap<ConnectionId, Binding>,
-    broker_connections: Connections<ConnectionId>,
-    requests: mpsc::Receiver<connection::Request>,
-    request_sender: mpsc::Sender<connection::Request>,
-    events: mpsc::Receiver<connection::Event>,
-    event_sender: mpsc::Sender<connection::Event>,
-    transports: JoinSet<(ConnectionId, io::Result<()>)>,
-    jobs: JoinSet<Completion>,
-    resources: Arc<Resources>,
-    devices: dev_broker::devices::Devices<ConnectionId>,
-    access: Option<grants::Change>,
-    idle_access: bool,
-    policy: policy::Policy,
-    policy_pending: Option<policy::Policy>,
-    policy_replies: Vec<Reply>,
-    policy_gate: watch::Sender<Permit>,
-    topology_paused: bool,
-    resume_policy: bool,
-    budget: Budget,
-    mutations: VecDeque<Mutation>,
-    transition: Option<Transition>,
-    selected: Option<ContextId>,
-    effective: Option<ContextId>,
-    vt: Option<crate::vt::Port>,
-    vt_facts: Option<watch::Receiver<crate::vt::Facts>>,
-    vt_generation: Option<u64>,
-    vt_release_sent: Option<u64>,
-    vt_requested: bool,
-    vt_suspended: bool,
-    switches: JoinSet<terminal::SwitchCompletion>,
+    state: RwLock<State>,
+    fatal: Fatal,
+    broker: broker::Control,
+    discovery: discovery::Control,
+    changed: watch::Sender<u64>,
+    #[cfg(feature = "vt")]
+    vt: linux_vt::Control,
+    #[cfg(feature = "vt")]
+    configured_vts: BTreeSet<u32>,
 }
-
-impl Controller {
-    pub fn new(name: SeatName, resources: Arc<Resources>, budget: Budget) -> (Self, Port) {
-        let (commands, receiver) = mpsc::channel(256);
-        let (policy_gate, _) = watch::channel(Permit::new());
-        let (request_sender, requests) = mpsc::channel(256);
-        let (event_sender, events) = mpsc::channel(256);
-        let (status, snapshot) = watch::channel(Status {
-            seat: (
-                name.to_string(),
-                0,
-                true,
-                String::new(),
-                String::new(),
-                "idle".into(),
-                String::new(),
-            ),
-            contexts: BTreeMap::new(),
-            connections: BTreeMap::new(),
-        });
-        (
-            Self {
-                name,
-                commands: receiver,
-                status,
-                contexts: BTreeMap::new(),
-                clients: BTreeMap::new(),
-                broker_connections: Connections::new(4096),
-                requests,
-                request_sender,
-                events,
-                event_sender,
-                transports: JoinSet::new(),
-                jobs: JoinSet::new(),
-                devices: dev_broker::devices::Devices::new(
-                    resources.broker(),
-                    budget.workers.clone(),
-                    budget.descriptors.clone(),
-                    4096,
-                ),
-                resources,
-                policy: policy::Policy::default(),
-                access: None,
-                idle_access: false,
-                policy_pending: None,
-                policy_replies: Vec::new(),
-                policy_gate: policy_gate.clone(),
-                topology_paused: false,
-                resume_policy: false,
-                budget,
-                mutations: VecDeque::new(),
-                transition: None,
-                selected: None,
-                effective: None,
-                vt: None,
-                vt_facts: None,
-                vt_generation: None,
-                vt_release_sent: None,
-                vt_requested: false,
-                vt_suspended: false,
-                switches: JoinSet::new(),
-            },
-            Port {
-                commands,
-                status: snapshot,
-                policy_gate,
-            },
-        )
+/// A cancelled or panicking admitted operation fences BEFORE its guard unlocks.
+struct Write<'a> {
+    guard: RwLockWriteGuard<'a, State>,
+    fatal: &'a Fatal,
+    deadline: Instant,
+    armed: bool,
+    watch_token: u64,
+}
+impl Deref for Write<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.guard
     }
-
-    pub async fn run(mut self, mut shutdown: Shutdown) -> io::Result<()> {
-        let mut quiescing = false;
-        let mut stopping = false;
-        let mut tick = interval(Duration::from_millis(25));
-        let mut reconcile = interval(Duration::from_secs(1));
-        loop {
-            self.update_vt()?;
-            self.retry_slots();
-            self.drive_access();
-            self.drive()?;
-            self.vt_progress()?;
-            self.policy_progress();
-            self.snapshot();
-            if stopping
-                && self.transports.is_empty()
-                && self.jobs.is_empty()
-                && !self.devices.has_jobs()
-                && self.switches.is_empty()
-            {
-                return Ok(());
-            }
-            tokio::select! {
-                biased;
-                phase = shutdown.reached(if quiescing { ShutdownPhase::RestoreTerminal } else { ShutdownPhase::Quiesce }), if !stopping => {
-                    quiescing = true;
-                    stopping = phase >= ShutdownPhase::RestoreTerminal;
-                    let contexts: Vec<_> = self.contexts.keys().copied().collect();
-                    for context in contexts { self.remove_context(context, None); }
-                }
-                command = self.commands.recv(), if !stopping => {
-                    let Some(command) = command else { return Err(io::Error::other("seat routing owner disappeared")) };
-                    if matches!(command, Command::Stop) {
-                        if !self.contexts.is_empty() { return Err(io::Error::other("seat stopped before cleanup")) }
-                        stopping = true;
-                    } else { self.command(command, quiescing)?; }
-                }
-                joined = self.transports.join_next(), if !self.transports.is_empty() => {
-                    let (id, _io_result) = joined.expect("transport exists").map_err(io::Error::other)?;
-                    self.transport_gone(id);
-                }
-                joined = self.jobs.join_next(), if !self.jobs.is_empty() => {
-                    self.complete(joined.expect("job exists").map_err(io::Error::other)?);
-                }
-                completed = self.devices.next_completion(), if self.devices.has_jobs() => {
-                    self.device_reply(completed?);
-                }
-                joined = self.switches.join_next(), if !self.switches.is_empty() => {
-                    self.switch_completed(joined.expect("switch exists").map_err(io::Error::other)?);
-                }
-                changed = terminal::changed(&mut self.vt_facts) => { changed?; }
-                event = self.events.recv() => if let Some(connection::Event::Delivered { connection, tag }) = event
-                    && self.broker_connections.delivered(connection, tag)
-                    && let Some(transition) = &mut self.transition {
-                    transition.pending_enable.remove(&connection);
-                },
-                _ = tick.tick() => {},
-                _ = reconcile.tick() => self.reconcile_access(),
-                request = self.requests.recv(), if !stopping => if let Some(request) = request { self.packet(request)?; },
+}
+impl DerefMut for Write<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.guard
+    }
+}
+impl Write<'_> {
+    fn arm(&mut self) {
+        if !self.armed {
+            self.deadline = self
+                .deadline
+                .min(Instant::now() + crate::fatal::EFFECT_LIMIT);
+            self.watch_token = self.fatal.begin_effect(self.deadline);
+        }
+        self.armed = true;
+    }
+    #[cfg(feature = "vt")]
+    fn shorten_deadline(&mut self, deadline: Instant) {
+        if deadline < self.deadline {
+            self.deadline = deadline;
+            if self.armed {
+                self.watch_token = self.fatal.begin_effect(deadline);
             }
         }
     }
-
-    fn command(&mut self, command: Command, quiescing: bool) -> io::Result<()> {
-        match command {
-            Command::Stop => unreachable!(),
-            Command::PreparePolicy { policy, reply } => self.pause_policy(policy, reply),
-            Command::CommitPolicy => self.commit_policy(),
-            Command::Grant {
-                context,
-                uid,
-                grant,
-                reply,
-            } => self.grant_request(context, uid, grant, reply, quiescing),
-            Command::Register {
-                context,
-                lifetime,
-                reply,
-            } => {
-                let result = if !quiescing && lifetime.is_live() {
-                    self.contexts.entry(context).or_insert(ContextState {
-                        grants: BTreeSet::new(),
-                        lifetime,
-                        phase: "inactive",
-                        connections: BTreeSet::new(),
-                        epoch: None,
-                        dirty: false,
-                        revoking: false,
-                        preparing: false,
-                        prepared: false,
-                        removing: false,
-                        retry: Instant::now(),
-                        error: String::new(),
-                        removed: Vec::new(),
-                    });
-                    Ok(())
-                } else {
-                    Err(ErrorKind::ContextRemoving)
-                };
-                self.snapshot();
-                let _ = reply.send(result);
-            }
-            Command::Remove { context, reply } => self.remove_context(context, Some(reply)),
-            Command::Activate { context, reply } => self.mutate(context, true, reply, quiescing),
-            Command::Deactivate { context, reply } => self.mutate(context, false, reply, quiescing),
-            Command::CreateConnection { context, reply } => {
-                let result = if quiescing {
-                    Err(ErrorKind::ContextRemoving)
-                } else {
-                    self.create_connection(context)
-                };
-                self.snapshot();
-                let _ = reply.send(result);
-            }
-            Command::RemoveConnection {
-                context,
-                connection,
-                reply,
-            } => {
-                if let Some(client) = self
-                    .clients
-                    .get_mut(&connection)
-                    .filter(|client| client.context == context)
-                {
-                    client.removed.retain(|sender| !sender.is_closed());
-                    if client.removed.len() == 64 {
-                        let _ = reply.send(Err(ErrorKind::LimitExceeded));
-                    } else {
-                        client.removed.push(reply);
-                        self.close_connection(connection);
-                    }
-                } else {
-                    let _ = reply.send(Err(ErrorKind::UnknownConnection));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn mutate(&mut self, context: ContextId, activate: bool, reply: Reply, quiescing: bool) {
-        if !quiescing
-            && !self.foreground()
-            && self.mutations.len() < 256
-            && self
-                .contexts
-                .get(&context)
-                .is_some_and(|state| !state.removing && state.lifetime.is_live())
-        {
-            if activate || self.selected == Some(context) {
-                let selected = activate.then_some(context);
-                self.selected = selected;
-                self.vt_requested = false;
-                if let Some(transition) = &mut self.transition
-                    && transition.target != selected
-                {
-                    transition.failure = Some(ErrorKind::TransitionPending);
-                }
-                let mut retained = VecDeque::new();
-                for mutation in self.mutations.drain(..) {
-                    if mutation.grant.is_none() {
-                        let _ = mutation.reply.send(Err(ErrorKind::TransitionPending));
-                    } else {
-                        retained.push_back(mutation);
-                    }
-                }
-                self.mutations = retained;
-            } else if self.contexts[&context].phase == "inactive"
-                && self.effective != Some(context)
-                && !self
-                    .mutations
-                    .iter()
-                    .any(|mutation| mutation.context == context)
-            {
-                let _ = reply.send(Ok(()));
-                return;
-            }
-        }
-        if quiescing
-            || !self
-                .contexts
-                .get(&context)
-                .is_some_and(|state| !state.removing && state.lifetime.is_live())
-        {
-            let _ = reply.send(Err(ErrorKind::ContextRemoving));
-        } else if self.mutations.is_empty()
-            && let Some(transition) = &mut self.transition
-            && transition.requested == context
-            && transition.activate == activate
-        {
-            transition.replies.retain(|reply| !reply.is_closed());
-            if transition.replies.len() == 64 {
-                let _ = reply.send(Err(ErrorKind::LimitExceeded));
-            } else {
-                transition.replies.push(reply);
-            }
-        } else if self.mutations.len() == 256 {
-            let _ = reply.send(Err(ErrorKind::LimitExceeded));
+    fn settle<T>(mut self, result: Result<T>) -> Result<T> {
+        let result = if result.is_ok() && self.armed && Instant::now() > self.deadline {
+            Err(self
+                .fatal
+                .fail("State effects did not settle before the cumulative deadline"))
         } else {
-            self.mutations.push_back(Mutation {
-                grant: None,
-                context,
-                activate,
-                reply,
-            });
+            result
+        };
+        self.armed = false;
+        self.fatal.end_effect(self.watch_token);
+        match result {
+            Err(error) => Err(error),
+            Ok(value) => {
+                self.fatal.check()?;
+                Ok(value)
+            }
         }
     }
-
-    fn create_connection(
-        &mut self,
-        context: ContextId,
-    ) -> Result<ConnectionPublication, ErrorKind> {
-        let state = self
-            .contexts
-            .get(&context)
-            .ok_or(ErrorKind::UnknownContext)?;
-        if state.removing || !state.lifetime.is_live() {
-            return Err(ErrorKind::ContextRemoving);
+}
+impl Drop for Write<'_> {
+    fn drop(&mut self) {
+        if self.armed || std::thread::panicking() {
+            self.fatal
+                .fail("admitted State operation cancelled or panicked before settlement");
         }
-        if state.connections.len() == 64 {
-            return Err(ErrorKind::LimitExceeded);
+        self.fatal.end_effect(self.watch_token);
+    }
+}
+struct Read<'a> {
+    guard: RwLockReadGuard<'a, State>,
+    fatal: &'a Fatal,
+}
+impl Deref for Read<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.guard
+    }
+}
+impl Drop for Read<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.fatal
+                .fail("read operation panicked before State unlock");
         }
-        let quota = self
-            .budget
-            .connections
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ErrorKind::LimitExceeded)?;
-        let (server, endpoint) = UnixStream::pair().map_err(|_| ErrorKind::BackendFailure)?;
-        let id = ConnectionId::generate();
-        if self.clients.contains_key(&id) {
-            return Err(ErrorKind::BackendFailure);
-        }
-        let lifetime = state.lifetime.clone();
-        let _resource_owner = self
-            .devices
-            .register(id)
-            .map_err(|_| ErrorKind::LimitExceeded)?;
-        let (port, output, closed) = connection::channel();
-        let close = self.broker_connections.add(id, port);
-        let requests = self.request_sender.clone();
-        let events = self.event_sender.clone();
-        self.transports.spawn(async move {
-            (
-                id,
-                connection::run(id, server.into(), output, closed, requests, events).await,
-            )
-        });
-        self.clients.insert(
-            id,
-            Binding {
-                operations: 0,
-                context,
-                removed: Vec::new(),
-                _quota: quota,
-            },
-        );
-        self.contexts
-            .get_mut(&context)
-            .expect("context")
-            .connections
-            .insert(id);
-        Ok(ConnectionPublication {
-            id,
-            #[cfg(test)]
-            resource_owner: _resource_owner,
-            fd: Some(endpoint.into()),
-            close,
-            lifetime,
-            committed: false,
+    }
+}
+impl Seat {
+    pub fn new(
+        name: SeatName,
+        broker: broker::Control,
+        discovery: discovery::Control,
+        fatal: Fatal,
+        workers: Arc<Semaphore>,
+        #[cfg(feature = "vt")] vt: linux_vt::Control,
+        #[cfg(feature = "vt")] configured_vts: BTreeSet<u32>,
+    ) -> io::Result<Self> {
+        let (changed, _) = watch::channel(0);
+        let mut acl = AclRegistry::new(NODE_LIMIT, workers)?;
+        let alive = fatal.gate();
+        acl.set_lifetime(move || alive.load(std::sync::atomic::Ordering::Acquire));
+        Ok(Self {
+            state: RwLock::new(State {
+                catalog: DeviceCatalog::new(name.clone()),
+                acl,
+                authorities: Authorities::new(CONTEXT_LIMIT, 1024).map_err(io::Error::other)?,
+                contexts: BTreeMap::new(),
+                applied: None,
+                sequence: 0,
+                #[cfg(not(feature = "vt"))]
+                active: None,
+                #[cfg(feature = "vt")]
+                active: BTreeMap::new(),
+                #[cfg(feature = "vt")]
+                foreground: Foreground {
+                    observed: None,
+                    available: false,
+                },
+                #[cfg(feature = "vt")]
+                foreground_waits: Vec::new(),
+            }),
+            name,
+            fatal,
+            broker,
+            discovery,
+            changed,
+            #[cfg(feature = "vt")]
+            vt,
+            #[cfg(feature = "vt")]
+            configured_vts,
         })
     }
-
-    fn send(&self, id: ConnectionId, bytes: Vec<u8>, tag: Option<u64>) -> bool {
-        self.broker_connections.send(id, bytes, tag)
-    }
-
-    fn enable(&mut self, id: ConnectionId) -> io::Result<bool> {
-        let context = &self.contexts[&self.clients[&id].context];
-        self.broker_connections.enable(id, context.epoch.as_ref())
-    }
-
-    fn fence_context(&mut self, id: ContextId, pending: &mut BTreeSet<ConnectionId>) {
-        let Some(context) = self.contexts.get_mut(&id) else {
-            return;
-        };
-        if let Some(epoch) = &context.epoch {
-            epoch.fence();
-        }
-        context.phase = if context.removing {
-            "removing"
-        } else {
-            "deactivating"
-        };
-        context.prepared = false;
-        let connections: Vec<_> = context.connections.iter().copied().collect();
-        self.retire_inputs(id);
-        for connection in connections {
-            if self.broker_connections.pause(connection) {
-                pending.insert(connection);
-            }
-        }
-    }
-
-    fn remove_context(&mut self, id: ContextId, reply: Option<Reply>) {
-        let Some(context) = self.contexts.get_mut(&id) else {
-            if let Some(reply) = reply {
-                let _ = reply.send(Ok(()));
-            }
-            return;
-        };
-        context.removing = true;
-        context.grants.clear();
-        context.phase = "removing";
-        if let Some(epoch) = &context.epoch {
-            epoch.fence();
-        }
-        if let Some(reply) = reply {
-            context.removed.retain(|sender| !sender.is_closed());
-            if context.removed.len() < 64 {
-                context.removed.push(reply);
-            } else {
-                let _ = reply.send(Err(ErrorKind::LimitExceeded));
-            }
-        }
-        let connections: Vec<_> = context.connections.iter().copied().collect();
-        for connection in connections {
-            self.close_connection(connection);
-        }
-        if self.selected == Some(id) {
-            self.selected = None;
-        }
-        if self.effective == Some(id) {
-            self.effective = None;
-        }
-        if let Some(transition) = &mut self.transition {
-            if transition.target == Some(id) {
-                transition.target = None;
-                transition.failure = Some(ErrorKind::ContextRemoving);
-            }
-            if self.contexts[&id].dirty {
-                transition.withdrawing.insert(id);
-            }
-        }
-    }
-
-    fn close_connection(&mut self, id: ConnectionId) {
-        self.broker_connections.close(id);
-    }
-
-    fn transport_gone(&mut self, id: ConnectionId) {
-        if !self.clients.contains_key(&id) {
-            return;
-        }
-        self.broker_connections.gone(id);
-        self.devices.begin_cleanup(id);
-        if let Some(transition) = &mut self.transition {
-            transition.pending_disable.remove(&id);
-            if transition.pending_enable.remove(&id) {
-                transition.failure = Some(ErrorKind::BackendFailure);
-            }
-        }
-    }
-
-    fn job(&mut self, job: Job) -> bool {
-        let resources = self.resources.clone();
-        let owners: Vec<(ConnectionKey, Option<Permit>)> = match job {
-            Job::Revoke(id) => self.contexts[&id]
-                .connections
-                .iter()
-                .map(|owner| (self.devices.owner(*owner).expect("connection owner"), None))
-                .collect(),
-            Job::Prepare(id) => {
-                let context = &self.contexts[&id];
-                let epoch = context.epoch.as_ref().expect("activation epoch").clone();
-                context
-                    .connections
-                    .iter()
-                    .filter_map(|id| {
-                        let permit = self.broker_connections.prepare(*id, &epoch)?;
-                        Some((
-                            self.devices.owner(*id).expect("connection owner"),
-                            Some(permit),
-                        ))
-                    })
-                    .collect()
-            }
-            Job::Close(id) => vec![(self.devices.owner(id).expect("connection owner"), None)],
-            Job::Access(_) | Job::IdleAccess => Vec::new(),
-        };
-        let (nodes, users, node_permit) = match job {
-            Job::Revoke(_) | Job::IdleAccess => {
-                (self.policy.nodes.clone(), BTreeSet::new(), Permit::new())
-            }
-            Job::Prepare(id) => (
-                self.policy.nodes.clone(),
-                self.contexts[&id].grants.clone(),
-                self.contexts[&id].epoch.clone().expect("activation permit"),
-            ),
-            Job::Access(id) => {
-                let state = &self.contexts[&id];
-                let permit = state.epoch.clone().unwrap_or_default();
-                let users = if self.effective == Some(id) && !state.removing && permit.is_open() {
-                    state.grants.clone()
-                } else {
-                    BTreeSet::new()
-                };
-                (self.policy.nodes.clone(), users, permit)
-            }
-            Job::Close(_) => (BTreeSet::new(), BTreeSet::new(), Permit::new()),
-        };
-        self.jobs.spawn(
-            work::Work {
-                resources,
-                owners,
-                nodes,
-                users,
-                node_permit,
-                job,
-            }
-            .run(self.budget.workers.clone(), self.budget.acl_workers.clone()),
-        );
-        true
-    }
-
-    fn complete(&mut self, completion: Completion) {
-        match completion.job {
-            Job::IdleAccess => {
-                self.idle_access = false;
-                if let Some(error) = completion.error {
-                    tracing::warn!(%error, seat = %self.name, "idle ACL reconciliation failed");
-                }
-            }
-            Job::Access(id) => self.access_completed(id, completion.error),
-            Job::Revoke(id) => {
-                if let Some(context) = self.contexts.get_mut(&id) {
-                    context.revoking = false;
-                    if let Some(error) = completion.error {
-                        context.error = error;
-                        context.retry = Instant::now() + Duration::from_secs(1);
-                    } else {
-                        context.dirty = false;
-                        context.error.clear();
-                        context.phase = if context.removing {
-                            "removing"
-                        } else {
-                            "inactive"
-                        };
-                    }
-                }
-            }
-            Job::Prepare(id) => {
-                if let Some(context) = self.contexts.get_mut(&id) {
-                    context.preparing = false;
-                    if let Some(error) = completion.error {
-                        context.error = error;
-                        if let Some(transition) = &mut self.transition {
-                            transition.failure = Some(ErrorKind::BackendFailure);
-                        }
-                    } else {
-                        context.prepared = true;
-                    }
-                }
-            }
-            Job::Close(id) => {
-                if self
-                    .broker_connections
-                    .cleanup_completed(id, completion.error)
-                {
-                    self.devices.cleaned(id);
-                }
-            }
-        }
-    }
-
-    fn drive(&mut self) -> io::Result<()> {
-        let dead: Vec<_> = self
-            .contexts
-            .iter()
-            .filter(|(_, state)| !state.removing && !state.lifetime.is_live())
-            .map(|(id, _)| *id)
-            .collect();
-        for id in dead {
-            self.remove_context(id, None);
-        }
-        let cleanup: Vec<_> = self
-            .clients
-            .iter()
-            .filter(|(id, binding)| {
-                let client = &self.broker_connections[id];
-                !self.devices.running(**id)
-                    && client.cleanup
-                    && !client.cleanup_running
-                    && binding.operations == 0
-                    && client.retry <= Instant::now()
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in cleanup {
-            if self.job(Job::Close(id)) {
-                self.broker_connections.cleanup_started(id);
-            }
-        }
-        let removed: Vec<_> = self
-            .clients
-            .iter()
-            .filter(|(id, _)| {
-                let client = &self.broker_connections[id];
-                client.gone && !client.cleanup && !client.cleanup_running
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in removed {
-            self.devices.forget(id)?;
-            self.broker_connections.remove(id)?;
-            let client = self.clients.remove(&id).expect("client");
-            if let Some(context) = self.contexts.get_mut(&client.context) {
-                context.connections.remove(&id);
-            }
-            for reply in client.removed {
-                let _ = reply.send(Ok(()));
-            }
-        }
-        if !self.topology_paused
-            && self.access.is_none()
-            && !self.idle_access
-            && self.transition.is_none()
-            && let Some(mutation) = self.mutations.pop_front()
-        {
-            if let Some((uid, grant)) = mutation.grant {
-                self.begin_grant(mutation.context, uid, grant, mutation.reply);
-            } else if !self
-                .contexts
-                .get(&mutation.context)
-                .is_some_and(|state| !state.removing && state.lifetime.is_live())
-            {
-                let _ = mutation.reply.send(Err(ErrorKind::ContextRemoving));
-            } else if (mutation.activate && self.effective == Some(mutation.context))
-                || (!mutation.activate
-                    && self.selected != Some(mutation.context)
-                    && self.effective != Some(mutation.context))
-            {
-                let _ = mutation.reply.send(Ok(()));
-            } else {
-                let target = mutation.activate.then_some(mutation.context);
-                self.selected = target;
-                // Removal clears the effective reference immediately, but it
-                // does not erase its resource barrier. Include every retained
-                // predecessor, not just the last effective-context pointer.
-                let mut withdrawing: BTreeSet<_> = self
-                    .contexts
-                    .iter()
-                    .filter(|(id, state)| {
-                        Some(**id) != target
-                            && (state.dirty
-                                || state.revoking
-                                || state.preparing
-                                || self.context_operations(**id))
-                    })
-                    .map(|(id, _)| *id)
-                    .collect();
-                let mut pending_disable = BTreeSet::new();
-                if let Some(old) = self.effective.take() {
-                    withdrawing.insert(old);
-                }
-                for old in &withdrawing {
-                    self.fence_context(*old, &mut pending_disable);
-                }
-                if let Some(id) = target {
-                    let epoch = self.epoch(id);
-                    let state = self.contexts.get_mut(&id).expect("target");
-                    state.phase = "activating";
-                    state.epoch = Some(epoch);
-                    state.prepared = false;
-                }
-                self.transition = Some(Transition {
-                    requested: mutation.context,
-                    activate: mutation.activate,
-                    target,
-                    withdrawing,
-                    pending_disable,
-                    pending_enable: BTreeSet::new(),
-                    deadline: Instant::now() + Duration::from_secs(2),
-                    enabling: false,
-                    replies: vec![mutation.reply],
-                    failure: None,
-                });
-            }
-        }
-        let revoke: Vec<_> = self
-            .contexts
-            .iter()
-            .filter(|(_, state)| {
-                state.dirty
-                    && !state.revoking
-                    && !state.preparing
-                    && state.retry <= Instant::now()
-                    && matches!(state.phase, "deactivating" | "removing")
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in revoke {
-            if self.job(Job::Revoke(id)) {
-                self.contexts.get_mut(&id).expect("context").revoking = true;
-            }
-        }
-        if let Some(mut transition) = self.transition.take() {
-            transition.pending_disable.retain(|id| {
-                self.broker_connections.get(id).is_some_and(|client| {
-                    !client.gone && client.membership == Membership::PendingDisable
-                })
-            });
-            if Instant::now() >= transition.deadline {
-                for id in &transition.pending_disable {
-                    self.close_connection(*id);
-                }
-            }
-            if transition.failure.is_some()
-                && let Some(target) = transition.target.take()
-            {
-                if !self.topology_paused && !self.vt_suspended && self.foreground() {
-                    self.selected = None;
-                }
-                self.effective = None;
-                transition.withdrawing.insert(target);
-                transition.pending_enable.clear();
-                transition.enabling = false;
-                transition.deadline = Instant::now() + Duration::from_secs(2);
-                self.fence_context(target, &mut transition.pending_disable);
-            }
-            let withdrawn = transition.withdrawing.iter().all(|id| {
-                self.contexts
-                    .get(id)
-                    .is_none_or(|state| !state.dirty && !state.revoking && !state.preparing)
-                    && !self.context_operations(*id)
-                    && !self.access_pending(*id)
-            });
-            if withdrawn && transition.pending_disable.is_empty() {
-                for id in &transition.withdrawing {
-                    if let Some(state) = self.contexts.get_mut(id)
-                        && !state.removing
-                    {
-                        state.phase = "inactive";
-                    }
-                }
-                if let Some(target) = transition.target.filter(|_| self.foreground()) {
-                    if !self.contexts[&target].prepared && !self.contexts[&target].preparing {
-                        let epoch = self.epoch(target);
-                        self.contexts.get_mut(&target).expect("target").epoch = Some(epoch);
-                    }
-                    let state = self.contexts.get_mut(&target).expect("target");
-                    if !state.prepared && !state.preparing {
-                        state.dirty = true;
-                        if self.job(Job::Prepare(target)) {
-                            self.contexts.get_mut(&target).expect("target").preparing = true;
-                        }
-                    } else if state.prepared && !transition.enabling {
-                        self.effective = Some(target);
-                        transition.enabling = true;
-                        let members: Vec<_> = state
-                            .connections
-                            .iter()
-                            .copied()
-                            .filter(|id| {
-                                self.broker_connections.get(id).is_some_and(|client| {
-                                    client.membership == Membership::Disabled && !client.closing
-                                })
-                            })
-                            .collect();
-                        for id in members {
-                            transition.pending_enable.insert(id);
-                            if !self.enable(id)? {
-                                transition.failure = Some(ErrorKind::BackendFailure);
-                            }
-                        }
-                    }
-                    if transition.enabling
-                        && transition.pending_enable.is_empty()
-                        && transition.failure.is_none()
-                    {
-                        self.contexts.get_mut(&target).expect("target").phase = "active";
-                        for reply in transition.replies {
-                            let _ = reply.send(Ok(()));
-                        }
-                    } else {
-                        self.transition = Some(transition);
-                    }
-                } else if let Some(target) = transition.target {
-                    self.request_foreground(target)?;
-                    self.transition = Some(transition);
-                } else {
-                    for reply in transition.replies {
-                        let _ = reply.send(transition.failure.map_or(Ok(()), Err));
-                    }
-                }
-            } else {
-                self.transition = Some(transition);
-            }
-        }
-        let removed: Vec<_> = self
-            .contexts
-            .iter()
-            .filter(|(id, state)| {
-                state.removing
-                    && state.connections.is_empty()
-                    && !state.dirty
-                    && !state.preparing
-                    && !state.revoking
-                    && !self.access_pending(**id)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in removed {
-            let state = self.contexts.remove(&id).expect("context");
-            for reply in state.removed {
-                let _ = reply.send(Ok(()));
-            }
-        }
+    #[cfg(feature = "test-support")]
+    pub fn inject_acl_fault(&self, fault: dev_acl::TestFault) -> io::Result<()> {
+        self.state
+            .try_write()
+            .map_err(|_| io::Error::other("fixture injection requires exclusive startup"))?
+            .acl
+            .inject_fault(fault);
         Ok(())
     }
-
-    fn packet(&mut self, request: connection::Request) -> io::Result<()> {
-        let connection::Request {
-            connection: id,
-            packet,
-            done,
-        } = request;
-        let Some(client) = self.clients.get(&id) else {
-            return Ok(());
-        };
-        if !self.contexts[&client.context].lifetime.is_live()
-            || !self.broker_connections.valid_packet(id, &packet)
-        {
-            self.close_connection(id);
-            return Ok(());
-        }
-        match packet.opcode {
-            wire::CLIENT_PING => {
-                self.send(id, wire::empty(wire::SERVER_PONG), None);
-            }
-            wire::CLIENT_OPEN_SEAT => {
-                if !self.broker_connections.open_seat(id) {
-                    self.send(id, wire::error(libc::EBUSY), None);
-                } else {
-                    self.send(id, wire::seat_opened(self.name.as_str())?, None);
-                    let context = self.clients[&id].context;
-                    if self.effective == Some(context) {
-                        let delivered = self.enable(id)?;
-                        if let Some(transition) = &mut self.transition
-                            && transition.target == Some(context)
-                            && transition.enabling
-                        {
-                            transition.pending_enable.insert(id);
-                            if !delivered {
-                                transition.failure = Some(ErrorKind::BackendFailure);
-                            }
-                        }
-                    }
-                }
-            }
-            wire::CLIENT_CLOSE_SEAT => {
-                self.broker_connections.close_seat(id, done);
-                self.devices.begin_cleanup(id);
-                if let Some(transition) = &mut self.transition {
-                    transition.pending_disable.remove(&id);
-                    transition.pending_enable.remove(&id);
-                }
-                return Ok(());
-            }
-            wire::CLIENT_DISABLE_SEAT => {
-                self.broker_connections.acknowledge(id);
-            }
-            wire::CLIENT_OPEN_DEVICE => {
-                self.open_device(
-                    id,
-                    wire::parse_path(&packet.payload).expect("validated path"),
-                    done,
-                );
-                return Ok(());
-            }
-            wire::CLIENT_CLOSE_DEVICE => {
-                self.close_device(
-                    id,
-                    wire::parse_i32(&packet.payload).expect("validated ID"),
-                    done,
-                );
-                return Ok(());
-            }
-            wire::CLIENT_SWITCH_SESSION => {
-                self.switch_protocol(
-                    id,
-                    wire::parse_i32(&packet.payload).expect("validated target"),
-                    done,
-                );
-                return Ok(());
-            }
-            _ => unreachable!(),
-        }
-        let _ = done.send(());
-        Ok(())
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
     }
-
-    fn snapshot(&self) {
-        let contexts = self
-            .contexts
-            .iter()
-            .map(|(id, context)| {
-                (
-                    *id,
-                    (
-                        id.to_string(),
-                        self.name.to_string(),
-                        context.phase.into(),
-                        context.grants.iter().copied().collect::<Vec<_>>(),
-                        context
-                            .connections
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect(),
-                        self.selected == Some(*id),
-                        self.effective == Some(*id),
-                        context.error.clone(),
-                    ),
-                )
-            })
-            .collect();
-        let connections = self
-            .clients
-            .iter()
-            .map(|(id, client)| {
-                (
-                    *id,
-                    (
-                        id.to_string(),
-                        client.context.to_string(),
-                        self.name.to_string(),
-                        self.broker_connections[id].membership.name().into(),
-                        self.broker_connections[id].error.clone(),
-                    ),
-                )
-            })
-            .collect();
-        self.status.send_replace(Status {
-            seat: (
-                self.name.to_string(),
-                self.vt_facts
-                    .as_ref()
-                    .map(|facts| facts.borrow().terminal)
-                    .unwrap_or(0),
-                self.foreground(),
-                self.selected.map(|id| id.to_string()).unwrap_or_default(),
-                self.effective.map(|id| id.to_string()).unwrap_or_default(),
-                if self.topology_paused {
-                    "topology"
-                } else if self.transition.is_some() {
-                    "transition"
-                } else {
-                    "idle"
-                }
-                .into(),
-                self.contexts
-                    .values()
-                    .find(|context| !context.error.is_empty())
-                    .map(|context| context.error.clone())
-                    .unwrap_or_default(),
-            ),
-            contexts,
-            connections,
+    pub fn fatal(&self) -> &Fatal {
+        &self.fatal
+    }
+    fn changed(&self) {
+        self.changed.send_modify(|revision| {
+            *revision = revision.checked_add(1).expect("revision exhaustion")
         });
     }
+    async fn read(&self, budget: Budget) -> Result<Read<'_>> {
+        self.fatal.check()?;
+        let guard = timeout_at(budget.reply, self.state.read())
+            .await
+            .map_err(|_| Error::new(ErrorKind::Busy, "State read admission expired"))?;
+        self.fatal.check()?;
+        Ok(Read {
+            guard,
+            fatal: &self.fatal,
+        })
+    }
+    async fn write(&self, budget: Budget) -> Result<Write<'_>> {
+        self.fatal.check()?;
+        let guard = timeout_at(budget.admission(), self.state.write())
+            .await
+            .map_err(|_| Error::new(ErrorKind::Busy, "State mutation admission expired"))?;
+        self.fatal.check()?;
+        budget.effect_deadline()?;
+        Ok(Write {
+            guard,
+            fatal: &self.fatal,
+            deadline: budget.admission(),
+            armed: false,
+            watch_token: 0,
+        })
+    }
+    async fn source_write(&self) -> Result<Write<'_>> {
+        self.fatal.check()?;
+        let guard = self.state.write().await;
+        self.fatal.check()?;
+        Ok(Write {
+            guard,
+            fatal: &self.fatal,
+            deadline: Instant::now() + crate::fatal::EFFECT_LIMIT,
+            armed: false,
+            watch_token: 0,
+        })
+    }
+    async fn required<T>(
+        &self,
+        deadline: Instant,
+        stage: &str,
+        work: impl Future<Output = io::Result<T>>,
+    ) -> Result<T> {
+        match timeout_at(deadline, work).await {
+            Ok(Ok(value)) if Instant::now() <= deadline => Ok(value),
+            Ok(Ok(_)) => Err(self.fatal.fail(format!(
+                "{stage}: required settlement arrived after the cumulative deadline"
+            ))),
+            Ok(Err(error)) => Err(self.fatal.fail(format!("{stage}: {error}"))),
+            Err(_) => Err(self.fatal.fail(format!(
+                "{stage}: cumulative required-effect deadline expired; started work remains owned"
+            ))),
+        }
+    }
+    fn authority_error(&self, error: AuthorityError) -> Error {
+        match error {
+            AuthorityError::AccessDenied => Error::new(ErrorKind::NotAuthorized, error.to_string()),
+            AuthorityError::LimitExceeded => {
+                Error::new(ErrorKind::LimitExceeded, error.to_string())
+            }
+            _ => self.fatal.fail(error.to_string()),
+        }
+    }
+    fn live(&self, state: &State, id: ContextId) -> Result<()> {
+        let context = state
+            .contexts
+            .get(&id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "context not found"))?;
+        if context
+            .lifetime
+            .is_alive()
+            .map_err(|error| self.fatal.fail(format!("context lifetime: {error}")))?
+        {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorKind::NotAuthorized,
+                "context lifetime ended",
+            ))
+        }
+    }
+    fn eligible(&self, state: &State) -> Result<Option<ContextId>> {
+        #[cfg(not(feature = "vt"))]
+        let id = state.active;
+        #[cfg(feature = "vt")]
+        let id = state
+            .foreground
+            .observed
+            .filter(|_| state.foreground.available)
+            .and_then(|vt| state.active.get(&vt).copied());
+        match id {
+            None => Ok(None),
+            Some(id) => match self.live(state, id) {
+                Ok(()) => Ok(Some(id)),
+                Err(error) if error.kind == ErrorKind::NotAuthorized => Ok(None),
+                Err(error) => Err(error),
+            },
+        }
+    }
+    fn is_active(state: &State, id: ContextId) -> bool {
+        #[cfg(not(feature = "vt"))]
+        {
+            state.active == Some(id)
+        }
+        #[cfg(feature = "vt")]
+        {
+            state
+                .contexts
+                .get(&id)
+                .is_some_and(|context| state.active.get(&context.vt) == Some(&id))
+        }
+    }
+    fn clear_active(state: &mut State, id: ContextId) {
+        #[cfg(not(feature = "vt"))]
+        if state.active == Some(id) {
+            state.active = None;
+        }
+        #[cfg(feature = "vt")]
+        if let Some(context) = state.contexts.get(&id)
+            && state.active.get(&context.vt) == Some(&id)
+        {
+            state.active.remove(&context.vt);
+        }
+    }
+    fn set_acl_target(&self, state: &mut State, target: &BTreeSet<u32>) -> Result<()> {
+        let removed: Vec<_> = state
+            .acl
+            .desired_users()
+            .difference(target)
+            .copied()
+            .collect();
+        for uid in removed {
+            state.acl.remove_acl_grant(uid);
+        }
+        for &uid in target {
+            state
+                .acl
+                .add_acl_grant(uid)
+                .map_err(|error| self.fatal.fail(format!("validated ACL target: {error}")))?;
+        }
+        Ok(())
+    }
+    async fn reconcile(
+        &self,
+        state: &mut State,
+        deadline: Instant,
+        force_acl: bool,
+        exclude: Option<ContextId>,
+    ) -> Result<()> {
+        let candidate = self.eligible(state)?.filter(|id| Some(*id) != exclude);
+        let same = state.applied.as_ref().is_some_and(|applied| {
+            Some(applied.context) == candidate && applied.permission.is_open()
+        });
+        if state.applied.is_some() && !same {
+            let previous = state.applied.as_ref().expect("applied");
+            previous.permission.fence();
+            let keys = state
+                .contexts
+                .get(&previous.context)
+                .map(|context| context.connections.keys().copied().collect())
+                .unwrap_or_default();
+            self.set_acl_target(state, &BTreeSet::new())?;
+            let State { catalog, acl, .. } = state;
+            tokio::try_join!(
+                self.required(
+                    deadline,
+                    "context broker withdrawal",
+                    self.broker.withdraw_connections(keys, false)
+                ),
+                self.required(deadline, "context ACL withdrawal", async {
+                    acl.clear_obsolete_device_acls(&catalog.view()).await
+                }),
+            )?;
+            state.applied = None;
+        }
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        if !same {
+            let context = &state.contexts[&candidate];
+            let lifetime = context.lifetime.clone();
+            let permission = Permit::with_lifetime(move || lifetime.is_alive().unwrap_or(false))
+                .gated(self.fatal.gate());
+            let keys = context.connections.keys().copied().collect();
+            let target = context.grants.clone();
+            self.set_acl_target(state, &target)?;
+            let acl_permission = permission.clone();
+            state.acl.set_lifetime(move || acl_permission.is_open());
+            let State { catalog, acl, .. } = state;
+            tokio::try_join!(
+                async {
+                    match timeout_at(
+                        deadline,
+                        self.broker.allow_connections(keys, permission.clone()),
+                    )
+                    .await
+                    {
+                        Ok(Err(error))
+                            if error.raw_os_error() == Some(libc::EACCES)
+                                && !permission.is_open() =>
+                        {
+                            Ok(false)
+                        }
+                        Ok(Ok(())) => Ok(true),
+                        Ok(Err(error)) => Err(self
+                            .fatal
+                            .fail(format!("context broker application: {error}"))),
+                        Err(_) => Err(self
+                            .fatal
+                            .fail("context broker application deadline expired")),
+                    }
+                },
+                self.required(deadline, "context ACL application", async {
+                    acl.refresh_device_acls(&catalog.view()).await
+                }),
+            )?;
+            // Failure fences and returns immediately, never waiting for the
+            // other lane. Original resources/jobs remain owned for cleanup.
+            state.applied = Some(Applied {
+                context: candidate,
+                permission,
+            });
+        } else if force_acl {
+            let target = state.contexts[&candidate].grants.clone();
+            self.set_acl_target(state, &target)?;
+            let State { catalog, acl, .. } = state;
+            self.required(
+                deadline,
+                "current context ACL application",
+                acl.refresh_device_acls(&catalog.view()),
+            )
+            .await?;
+        }
+        // A lifetime may end while kernel work is running. Settle the real
+        // effects before unlocking; it never selects a replacement context.
+        if self.eligible(state)? != Some(candidate) {
+            if let Some(applied) = &state.applied {
+                applied.permission.fence();
+            }
+            let keys = state.contexts[&candidate]
+                .connections
+                .keys()
+                .copied()
+                .collect();
+            self.set_acl_target(state, &BTreeSet::new())?;
+            let State { catalog, acl, .. } = state;
+            tokio::try_join!(
+                self.required(
+                    deadline,
+                    "lost lifetime broker withdrawal",
+                    self.broker.withdraw_connections(keys, false)
+                ),
+                self.required(deadline, "lost lifetime ACL withdrawal", async {
+                    acl.clear_obsolete_device_acls(&catalog.view()).await
+                }),
+            )?;
+            state.applied = None;
+        }
+        Ok(())
+    }
+    pub async fn initialize(&self) -> Result<()> {
+        let mut op = self.write(Budget::new()).await?;
+        let Snapshot { sequence, scan } = timeout_at(op.deadline, self.discovery.scan())
+            .await
+            .map_err(|_| Error::new(ErrorKind::NotReady, "initial scan deadline expired"))?
+            .map_err(|error| Error::new(ErrorKind::NotReady, error.to_string()))?;
+        if op.deadline <= Instant::now() + crate::fatal::MIN_EFFECT_WINDOW {
+            return Err(Error::new(
+                ErrorKind::NotReady,
+                "no startup effect window remains",
+            ));
+        }
+        if scan.nodes.len() > NODE_LIMIT {
+            return Err(Error::new(ErrorKind::LimitExceeded, "initial node limit"));
+        }
+        op.arm();
+        let deadline = op.deadline;
+        let result = async {
+            op.catalog
+                .initialize(scan)
+                .map_err(|error| self.fatal.fail(format!("initial catalog: {error}")))?;
+            op.sequence = sequence;
+            #[cfg(feature = "vt")]
+            {
+                let current = self
+                    .required(deadline, "initial native foreground", self.vt.foreground())
+                    .await?;
+                op.foreground = Foreground {
+                    observed: self.configured_vts.contains(&current).then_some(current),
+                    available: true,
+                };
+            }
+            let State { catalog, acl, .. } = &mut *op;
+            self.required(
+                deadline,
+                "initial exact ACL cleanup",
+                acl.refresh_device_acls(&catalog.view()),
+            )
+            .await
+        }
+        .await;
+        op.settle(result)
+    }
+    pub async fn create_context(&self, vt: u32, budget: Budget) -> Result<(OwnedFd, ContextId)> {
+        #[cfg(not(feature = "vt"))]
+        if vt != 0 {
+            return Err(Error::invalid("non-VT seat accepts binding zero only"));
+        }
+        #[cfg(feature = "vt")]
+        if !self.configured_vts.contains(&vt) {
+            return Err(Error::invalid(
+                "binding is not in the configured startup VT set",
+            ));
+        }
+        let mut op = self.write(budget).await?;
+        if op.contexts.len() == CONTEXT_LIMIT {
+            return Err(Error::new(ErrorKind::LimitExceeded, "context limit"));
+        }
+        let issued = op
+            .authorities
+            .issue()
+            .map_err(|error| self.authority_error(error))?;
+        op.arm();
+        let lifetime = op
+            .authorities
+            .registration(issued.context)
+            .map_err(|error| self.authority_error(error))?;
+        op.contexts.insert(
+            issued.context,
+            Context {
+                #[cfg(feature = "vt")]
+                vt,
+                grants: BTreeSet::new(),
+                connections: BTreeMap::new(),
+                lifetime,
+            },
+        );
+        self.changed();
+        op.settle(Ok((issued.endpoint, issued.context)))
+    }
+    pub async fn activate_context(&self, id: ContextId, budget: Budget) -> Result<()> {
+        let mut op = self.write(budget).await?;
+        self.live(&op, id)?;
+        #[cfg(not(feature = "vt"))]
+        let occupied = op.active.is_some();
+        #[cfg(feature = "vt")]
+        let occupied = op.active.contains_key(&op.contexts[&id].vt);
+        if occupied {
+            return Err(Error::new(
+                ErrorKind::Busy,
+                "binding is occupied, including by this same context",
+            ));
+        }
+        op.arm();
+        let deadline = op.deadline;
+        #[cfg(not(feature = "vt"))]
+        {
+            op.active = Some(id);
+        }
+        #[cfg(feature = "vt")]
+        {
+            let vt = op.contexts[&id].vt;
+            op.active.insert(vt, id);
+        }
+        let result = async {
+            self.reconcile(&mut op, deadline, false, None).await?;
+            self.finish_live(&mut op, id, deadline).await
+        }
+        .await;
+        self.changed();
+        op.settle(result)
+    }
+    pub async fn deactivate_context(&self, id: ContextId, budget: Budget) -> Result<()> {
+        let mut op = self.write(budget).await?;
+        self.live(&op, id)?;
+        if !Self::is_active(&op, id) {
+            return Ok(());
+        }
+        op.arm();
+        let deadline = op.deadline;
+        let result = self.reconcile(&mut op, deadline, false, Some(id)).await;
+        if result.is_ok() {
+            Self::clear_active(&mut op, id);
+            self.changed();
+        }
+        op.settle(result)
+    }
+    async fn remove_locked(
+        &self,
+        state: &mut State,
+        id: ContextId,
+        deadline: Instant,
+    ) -> Result<()> {
+        if !state.contexts.contains_key(&id) {
+            return Ok(());
+        }
+        state.authorities.invalidate(id);
+        self.reconcile(state, deadline, false, Some(id)).await?;
+        let keys = state.contexts[&id].connections.keys().copied().collect();
+        self.required(
+            deadline,
+            "removed context connection retirement",
+            self.broker.withdraw_connections(keys, true),
+        )
+        .await?;
+        Self::clear_active(state, id);
+        state.contexts.remove(&id);
+        self.changed();
+        Ok(())
+    }
+    async fn finish_live(&self, state: &mut State, id: ContextId, deadline: Instant) -> Result<()> {
+        match self.live(state, id) {
+            Err(error) if error.kind == ErrorKind::NotAuthorized => {
+                self.remove_locked(state, id, deadline).await?;
+                Err(error)
+            }
+            result => result,
+        }
+    }
+    pub async fn remove_context(&self, authority: BorrowedFd<'_>, budget: Budget) -> Result<()> {
+        let mut op = self.write(budget).await?;
+        let id = op
+            .authorities
+            .resolve_removal(authority)
+            .map_err(|error| self.authority_error(error))?;
+        op.arm();
+        let deadline = op.deadline;
+        let result = self.remove_locked(&mut op, id, deadline).await;
+        op.settle(result)
+    }
+    pub async fn remove_context_by_id(&self, id: ContextId, budget: Budget) -> Result<()> {
+        let mut op = self.write(budget).await?;
+        op.arm();
+        let deadline = op.deadline;
+        let result = self.remove_locked(&mut op, id, deadline).await;
+        op.settle(result)
+    }
+    pub async fn set_grant(
+        &self,
+        authority: BorrowedFd<'_>,
+        uid: u32,
+        add: bool,
+        budget: Budget,
+    ) -> Result<()> {
+        if uid == u32::MAX {
+            return Err(Error::invalid("invalid UID"));
+        }
+        let mut op = self.write(budget).await?;
+        let id = op
+            .authorities
+            .resolve(authority)
+            .map_err(|error| self.authority_error(error))?;
+        let context = &op.contexts[&id];
+        if add && context.grants.len() == 64 && !context.grants.contains(&uid) {
+            return Err(Error::new(ErrorKind::LimitExceeded, "context UID limit"));
+        }
+        op.arm();
+        let deadline = op.deadline;
+        if add {
+            op.contexts
+                .get_mut(&id)
+                .expect("context")
+                .grants
+                .insert(uid);
+        } else {
+            op.contexts
+                .get_mut(&id)
+                .expect("context")
+                .grants
+                .remove(&uid);
+        }
+        let force = self.eligible(&op)? == Some(id);
+        let result = async {
+            self.reconcile(&mut op, deadline, force, None).await?;
+            self.finish_live(&mut op, id, deadline).await
+        }
+        .await;
+        self.changed();
+        op.settle(result)
+    }
+    pub async fn create_connection(
+        &self,
+        authority: BorrowedFd<'_>,
+        budget: Budget,
+    ) -> Result<(OwnedFd, u32)> {
+        let mut op = self.write(budget).await?;
+        let id = op
+            .authorities
+            .resolve(authority)
+            .map_err(|error| self.authority_error(error))?;
+        if op.contexts[&id].connections.len() == CONNECTION_LIMIT {
+            return Err(Error::new(
+                ErrorKind::LimitExceeded,
+                "context connection limit",
+            ));
+        }
+        let (server, endpoint) = UnixStream::pair()
+            .map_err(|error| Error::new(ErrorKind::LimitExceeded, error.to_string()))?;
+        let permission = op
+            .applied
+            .as_ref()
+            .filter(|applied| applied.context == id && applied.permission.is_open())
+            .map(|applied| applied.permission.clone());
+        op.arm();
+        let deadline = op.deadline;
+        let result = async {
+            let registered = match timeout_at(
+                deadline,
+                self.broker.add_connection(server.into(), permission),
+            )
+            .await
+            {
+                Ok(Ok(registered)) => registered,
+                Ok(Err(error))
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::EAGAIN)
+                    ) =>
+                {
+                    return Err(Error::new(
+                        ErrorKind::LimitExceeded,
+                        format!("connection registration rejected before effects: {error}"),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    return Err(self
+                        .fatal
+                        .fail(format!("broker connection registration: {error}")));
+                }
+                Err(_) => {
+                    return Err(self
+                        .fatal
+                        .fail("broker registration timed out; ownership remains with the broker"));
+                }
+            };
+            let handle = registered.handle;
+            op.contexts
+                .get_mut(&id)
+                .expect("context")
+                .connections
+                .insert(
+                    registered.key,
+                    Connection {
+                        handle,
+                        close: registered.close,
+                    },
+                );
+            self.finish_live(&mut op, id, deadline).await?;
+            self.changed();
+            Ok((endpoint.into(), handle))
+        }
+        .await;
+        op.settle(result)
+    }
+    fn info(&self, state: &State, id: ContextId) -> Result<ContextInfo> {
+        let context = &state.contexts[&id];
+        let effective = self.eligible(state)? == Some(id)
+            && state
+                .applied
+                .as_ref()
+                .is_some_and(|applied| applied.context == id && applied.permission.is_open());
+        #[cfg(not(feature = "vt"))]
+        let (vt, foreground) = (0, false);
+        #[cfg(feature = "vt")]
+        let (vt, foreground) = (
+            context.vt,
+            state.foreground.observed == Some(context.vt) && state.foreground.available,
+        );
+        let mut handles: Vec<_> = context
+            .connections
+            .values()
+            .filter(|connection| !connection.close.is_closed())
+            .map(|connection| connection.handle)
+            .collect();
+        handles.sort_unstable();
+        Ok(ContextInfo {
+            id,
+            vt,
+            desired_uids: context.grants.iter().copied().collect(),
+            connection_handles: handles,
+            active: Self::is_active(state, id),
+            foreground,
+            effective,
+        })
+    }
+    pub async fn get_context(
+        &self,
+        authority: BorrowedFd<'_>,
+        budget: Budget,
+    ) -> Result<ContextInfo> {
+        let state = self.read(budget).await?;
+        let id = state
+            .authorities
+            .resolve(authority)
+            .map_err(|error| self.authority_error(error))?;
+        self.info(&state, id)
+    }
+    pub async fn seat_metadata(
+        &self,
+        authority: BorrowedFd<'_>,
+        budget: Budget,
+    ) -> Result<(String, u32)> {
+        let state = self.read(budget).await?;
+        let id = state
+            .authorities
+            .resolve(authority)
+            .map_err(|error| self.authority_error(error))?;
+        #[cfg(not(feature = "vt"))]
+        {
+            let _ = id;
+            Ok((self.name.as_str().into(), 0))
+        }
+        #[cfg(feature = "vt")]
+        {
+            Ok((self.name.as_str().into(), state.contexts[&id].vt))
+        }
+    }
+    pub async fn list_contexts(&self, budget: Budget) -> Result<Vec<ContextInfo>> {
+        let state = self.read(budget).await?;
+        state
+            .contexts
+            .keys()
+            .map(|id| self.info(&state, *id))
+            .collect()
+    }
+    pub async fn prune_authorities(&self) -> Result<()> {
+        let mut op = self.write(Budget::new()).await?;
+        let retired = op
+            .authorities
+            .retire_ready()
+            .map_err(|error| self.authority_error(error))?;
+        if retired.is_empty() {
+            return Ok(());
+        }
+        op.arm();
+        let deadline = op.deadline;
+        let result = async {
+            for event in retired {
+                self.remove_locked(&mut op, event.context, deadline).await?;
+            }
+            Ok(())
+        }
+        .await;
+        op.settle(result)
+    }
+    pub async fn connection_gone(&self, key: ConnectionKey) -> Result<()> {
+        let mut op = self.source_write().await?;
+        op.arm();
+        for context in op.contexts.values_mut() {
+            if context.connections.remove(&key).is_some() {
+                self.changed();
+                break;
+            }
+        }
+        op.settle(Ok(()))
+    }
+    pub async fn refresh_devices(&self, addition: bool, budget: Budget) -> Result<()> {
+        let category = if addition {
+            ErrorKind::DeviceAdditionFailed
+        } else {
+            ErrorKind::DeviceRemovalFailed
+        };
+        let mut op = self.write(budget).await.map_err(|error| {
+            if error.kind == ErrorKind::Busy {
+                Error::new(category, error.text)
+            } else {
+                error
+            }
+        })?;
+        let snapshot = timeout_at(budget.admission(), self.discovery.scan())
+            .await
+            .map_err(|_| {
+                Error::new(
+                    category,
+                    "fresh enumeration expired before mutation admission",
+                )
+            })?
+            .map_err(|error| Error::new(category, format!("fresh enumeration: {error}")))?;
+        op.catalog
+            .validate_update(&snapshot.scan)
+            .map_err(|error| Error::new(category, error.to_string()))?;
+        if snapshot.scan.nodes.len() > NODE_LIMIT {
+            return Err(Error::new(
+                category,
+                "fresh node capacity exceeded before effects",
+            ));
+        }
+        let mut batch = op.catalog.removal_batch(&snapshot.scan);
+        // Candidate validation must precede effects; additions cannot silently
+        // withdraw an obsolete admission. Catalog validates before mutating.
+        if addition {
+            op.catalog
+                .validate_additions(&snapshot.scan)
+                .map_err(|error| Error::new(category, error.to_string()))?;
+        }
+        let deadline = budget
+            .effect_deadline()
+            .map_err(|error| Error::new(category, error.text))?;
+        op.arm();
+        let deadline = deadline.min(op.deadline);
+        let result = async {
+            op.sequence = snapshot.sequence;
+            if addition {
+                op.catalog
+                    .publish_additions(snapshot.scan)
+                    .map_err(|error| self.fatal.fail(format!("validated addition: {error}")))?;
+                let keep = op.catalog.broker_batch();
+                let State { catalog, acl, .. } = &mut *op;
+                tokio::try_join!(
+                    self.required(
+                        deadline,
+                        "replaced assigned device withdrawal",
+                        self.broker.revoke_unlisted_devices(keep)
+                    ),
+                    self.required(deadline, "obsolete assigned node ACL withdrawal", async {
+                        acl.clear_obsolete_device_acls(&catalog.view()).await
+                    }),
+                )?;
+                self.required(
+                    deadline,
+                    "assigned device ACL application",
+                    acl.refresh_device_acls(&catalog.view()),
+                )
+                .await?;
+            } else {
+                op.catalog
+                    .publish_removals(&snapshot.scan)
+                    .map_err(|error| self.fatal.fail(format!("validated removal: {error}")))?;
+                batch.settle_admissions(&op.catalog);
+                let keep = op.catalog.broker_batch();
+                tokio::try_join!(
+                    self.required(
+                        deadline,
+                        "unassigned broker withdrawal",
+                        self.broker.revoke_unlisted_devices(keep)
+                    ),
+                    self.required(
+                        deadline,
+                        "unassigned ACL withdrawal",
+                        op.acl.clear_obsolete_device_acls(&batch)
+                    ),
+                )?;
+            }
+            self.changed();
+            Ok(())
+        }
+        .await;
+        op.settle(result)
+    }
+    pub async fn physical_event(&self, event: discovery::Event) -> Result<()> {
+        let mut op = self.source_write().await?;
+        if event.sequence <= op.sequence {
+            return Ok(());
+        }
+        let path = match &event.hint {
+            PhysicalHint::Add { syspath, .. } | PhysicalHint::Remove { syspath } => syspath.clone(),
+        };
+        let current = match timeout_at(op.deadline, self.discovery.current(path.clone())).await {
+            Ok(Ok(current)) => current,
+            Ok(Err(error))
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::EAGAIN)
+                ) =>
+            {
+                self.discovery.refresh_needed();
+                return Ok(());
+            }
+            Ok(Err(error)) => {
+                return Err(self
+                    .fatal
+                    .fail(format!("physical hint revalidation: {error}")));
+            }
+            Err(_) => {
+                return Err(self
+                    .fatal
+                    .fail("physical hint owner did not revalidate within its bound"));
+            }
+        };
+        let key = path.to_string_lossy();
+        match event.hint {
+            PhysicalHint::Add { identity, .. } => {
+                let Some(node) = current.filter(|node| node.identity.same_inode(identity)) else {
+                    return Ok(());
+                };
+                if !op.catalog.can_add_node(&node) {
+                    self.discovery.refresh_needed();
+                    return Ok(());
+                }
+                op.arm();
+                let deadline = op.deadline;
+                op.catalog.device_added(node);
+                let keep = op.catalog.broker_batch();
+                let result = async {
+                    let State { catalog, acl, .. } = &mut *op;
+                    tokio::try_join!(
+                        self.required(
+                            deadline,
+                            "replaced physical broker withdrawal",
+                            self.broker.revoke_unlisted_devices(keep)
+                        ),
+                        self.required(deadline, "replaced physical ACL withdrawal", async {
+                            acl.clear_obsolete_device_acls(&catalog.view()).await
+                        }),
+                    )?;
+                    self.required(
+                        deadline,
+                        "physical node ACL application",
+                        acl.refresh_device_acls(&catalog.view()),
+                    )
+                    .await
+                }
+                .await;
+                self.changed();
+                op.settle(result)
+            }
+            PhysicalHint::Remove { .. } => {
+                let Some(previous) = op.catalog.live_node(&key).cloned() else {
+                    return Ok(());
+                };
+                if current
+                    .as_ref()
+                    .is_some_and(|node| node.identity == previous.identity)
+                {
+                    return Ok(());
+                }
+                op.arm();
+                let deadline = op.deadline;
+                op.catalog.device_removed(&key, previous.identity);
+                let keep = op.catalog.broker_batch();
+                let State { catalog, acl, .. } = &mut *op;
+                let result = tokio::try_join!(
+                    self.required(
+                        deadline,
+                        "removed physical broker withdrawal",
+                        self.broker.revoke_unlisted_devices(keep)
+                    ),
+                    self.required(deadline, "removed physical ACL withdrawal", async {
+                        acl.clear_obsolete_device_acls(&catalog.view()).await
+                    }),
+                )
+                .map(|_| ());
+                self.changed();
+                op.settle(result)
+            }
+        }
+    }
+    pub async fn broker_open(
+        &self,
+        key: ConnectionKey,
+        path: PathBuf,
+        permission: Permit,
+        done: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<()> {
+        let budget = Budget::new();
+        let state = self.read(budget).await?;
+        let admission = if permission.is_open() {
+            state.catalog.lookup_broker_node(&path, &permission)
+        } else {
+            None
+        };
+        let (start, waiting) = tokio::sync::oneshot::channel();
+        let result = self
+            .required(
+                budget.admission(),
+                "broker open registration",
+                self.broker.register_open(key, admission, waiting, done),
+            )
+            .await;
+        drop(state); // The actual resource registration is complete before unlock.
+        if result.is_ok() {
+            let _ = start.send(());
+        }
+        result
+    }
+    pub async fn publish_device(
+        &self,
+        key: ConnectionKey,
+        slot: i32,
+        permission: Permit,
+        output: connection::Output,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
+        let state = self.read(Budget::new()).await?;
+        let owner = state
+            .contexts
+            .iter()
+            .find(|(_, context)| context.connections.contains_key(&key))
+            .map(|(id, _)| *id);
+        let context = owner.and_then(|id| state.contexts.get(&id));
+        let permitted = permission.is_open()
+            && owner.is_some()
+            && owner == self.eligible(&state)?
+            && state.applied.as_ref().is_some_and(|applied| {
+                Some(applied.context) == owner && applied.permission.is_open()
+            });
+        if permitted {
+            match timeout_at(
+                Instant::now() + crate::fatal::FLUSH_LIMIT,
+                self.broker.publish(key, output),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                _ => {
+                    if let Some(context) = context {
+                        context.connections[&key].close.signal();
+                    }
+                }
+            }
+        } else {
+            self.broker
+                .reject_publication(key, slot)
+                .await
+                .map_err(|error| self.fatal.fail(format!("reject stale descriptor: {error}")))?;
+        }
+        drop(state);
+        if let Some(done) = done {
+            let _ = done.send(());
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "vt"))]
+    pub async fn move_to_foreground(&self, _id: ContextId, _budget: Budget) -> Result<()> {
+        Err(Error::invalid(
+            "foreground is inapplicable on a non-VT seat",
+        ))
+    }
+    #[cfg(feature = "vt")]
+    fn foreground_deadline(
+        &self,
+        state: &mut State,
+        deadline: Instant,
+        context: Option<ContextId>,
+    ) -> Instant {
+        use std::sync::atomic::Ordering;
+        state
+            .foreground_waits
+            .retain(|wait| wait.alive.load(Ordering::Acquire));
+        let mut deadline = deadline;
+        for wait in &state.foreground_waits {
+            if context.is_none() || context == Some(wait.context) {
+                wait.started.store(true, Ordering::Release);
+                deadline = deadline.min(wait.deadline);
+            }
+        }
+        deadline
+    }
+    #[cfg(feature = "vt")]
+    pub async fn release_requested(&self) -> Result<()> {
+        let mut op = self.source_write().await?;
+        op.arm();
+        let own_deadline = op.deadline;
+        let deadline = self.foreground_deadline(&mut op, own_deadline, None);
+        op.shorten_deadline(deadline);
+        op.foreground.available = false;
+        let result = async {
+            self.reconcile(&mut op, deadline, false, None).await?;
+            // An empty active/foreground association never suppresses native ACK.
+            self.required(
+                deadline,
+                "native release acknowledgement",
+                self.vt.acknowledge_release(),
+            )
+            .await?;
+            self.changed();
+            Ok(())
+        }
+        .await;
+        op.settle(result)
+    }
+    #[cfg(feature = "vt")]
+    pub async fn foreground_observed(&self) -> Result<()> {
+        let mut op = self.source_write().await?;
+        op.arm();
+        let own_deadline = op.deadline;
+        let result = async {
+            // Query AFTER State admission, never replay a historical signal VT.
+            let current = self
+                .required(
+                    own_deadline,
+                    "current native foreground",
+                    self.vt.foreground(),
+                )
+                .await?;
+            op.foreground = Foreground {
+                observed: self.configured_vts.contains(&current).then_some(current),
+                available: self.configured_vts.contains(&current),
+            };
+            let candidate = self.eligible(&op)?;
+            let deadline = self.foreground_deadline(&mut op, own_deadline, candidate);
+            op.shorten_deadline(deadline);
+            self.reconcile(&mut op, deadline, true, None).await?;
+            self.required(
+                deadline,
+                "native acquisition acknowledgement",
+                self.vt.acknowledge_acquisition(),
+            )
+            .await?;
+            self.changed();
+            Ok(())
+        }
+        .await;
+        op.settle(result)
+    }
+    #[cfg(feature = "vt")]
+    pub async fn move_to_foreground(&self, id: ContextId, budget: Budget) -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut changes = self.changes();
+        let mut op = self.write(budget).await.map_err(|error| {
+            if error.kind == ErrorKind::Busy {
+                Error::new(ErrorKind::VTActivationFailed, error.text)
+            } else {
+                error
+            }
+        })?;
+        self.live(&op, id)?;
+        if !Self::is_active(&op, id) {
+            return Err(Error::new(
+                ErrorKind::NotReady,
+                "foreground requires an active context",
+            ));
+        }
+        op.foreground_waits
+            .retain(|wait| wait.alive.load(Ordering::Acquire));
+        if op.foreground_waits.len() == 64 {
+            return Err(Error::new(
+                ErrorKind::LimitExceeded,
+                "foreground wait capacity",
+            ));
+        }
+        let vt = op.contexts[&id].vt;
+        op.arm();
+        let deadline = op.deadline;
+        let current = self
+            .required(
+                deadline,
+                "foreground request native observation",
+                self.vt.foreground(),
+            )
+            .await?;
+        if current == vt {
+            op.foreground = Foreground {
+                observed: Some(vt),
+                available: true,
+            };
+            let result = self.reconcile(&mut op, deadline, true, None).await;
+            self.changed();
+            return op.settle(result);
+        }
+        let submitted = timeout_at(deadline, self.vt.request_switch(vt))
+            .await
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::VTActivationFailed,
+                    "native switch submission expired; kernel progress may outlive this reply",
+                )
+            })
+            .and_then(|result| {
+                result.map_err(|error| {
+                    Error::new(
+                        ErrorKind::VTActivationFailed,
+                        format!("native switch submission: {error}"),
+                    )
+                })
+            });
+        if let Err(error) = submitted {
+            return op.settle(Err(error));
+        }
+        let alive = Arc::new(AtomicBool::new(true));
+        let started = Arc::new(AtomicBool::new(false));
+        let _lifetime = WaitLifetime(alive.clone());
+        op.foreground_waits.push(ForegroundWait {
+            context: id,
+            deadline,
+            alive,
+            started: started.clone(),
+        });
+        op.settle(Ok(()))?; // No guard is held while waiting for a kernel switch.
+        loop {
+            self.fatal.check()?;
+            let observed = self.read(Budget { reply: deadline }).await;
+            if let Ok(state) = observed {
+                if !state.contexts.contains_key(&id) || !Self::is_active(&state, id) {
+                    return Err(Error::new(
+                        ErrorKind::VTActivationFailed,
+                        "context changed while waiting for foreground",
+                    ));
+                }
+                if self.info(&state, id)?.effective
+                    && state.foreground.observed == Some(vt)
+                    && state.foreground.available
+                {
+                    return Ok(());
+                }
+            } else if self.fatal.stopping() {
+                self.fatal.check()?;
+            }
+            if Instant::now() >= deadline {
+                if started.load(Ordering::Acquire) {
+                    return Err(self
+                        .fatal
+                        .fail("foreground request required-policy deadline expired"));
+                }
+                return Err(Error::new(
+                    ErrorKind::VTActivationFailed,
+                    "kernel foreground did not settle before the response deadline; no rollback claimed",
+                ));
+            }
+            let _ = timeout_at(deadline, changes.changed()).await;
+        }
+    }
+    pub async fn protocol_switch(
+        &self,
+        key: ConnectionKey,
+        target: u32,
+        permission: Permit,
+    ) -> Result<()> {
+        #[cfg(not(feature = "vt"))]
+        {
+            let _ = (key, target, permission);
+            Err(Error::invalid("session switching requires a VT seat"))
+        }
+        #[cfg(feature = "vt")]
+        {
+            if !(1..=63).contains(&target) {
+                return Err(Error::invalid("target VT is outside 1..63"));
+            }
+            let budget = Budget::new();
+            let state = self.read(budget).await?;
+            let owner = state
+                .contexts
+                .iter()
+                .find(|(_, context)| context.connections.contains_key(&key))
+                .map(|(id, _)| *id);
+            if !permission.is_open() || owner.is_none() || owner != self.eligible(&state)? {
+                return Err(Error::new(
+                    ErrorKind::NotAuthorized,
+                    "connection is no longer eligible",
+                ));
+            }
+            timeout_at(budget.admission(), self.vt.request_switch(target))
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::VTActivationFailed,
+                        "protocol switch submission expired",
+                    )
+                })?
+                .map_err(|error| Error::new(ErrorKind::VTActivationFailed, error.to_string()))
+        }
+    }
+    /// Called after the reply barrier. This guard/future itself remains parent-
+    /// owned if the independent cleanup deadline expires.
+    /// Actual ACL settlement is separate from recorded operation/cleanup errors.
+    pub async fn cleanup(&self) -> (bool, Vec<io::Error>) {
+        let mut state = self.state.write().await;
+        state.authorities.invalidate_all();
+        if let Some(applied) = &state.applied {
+            applied.permission.fence();
+        }
+        for context in state.contexts.values() {
+            for connection in context.connections.values() {
+                connection.close.signal();
+            }
+        }
+        let errors = state.acl.shutdown().await;
+        (
+            !state.acl.has_started_work() && state.acl.retained() == 0,
+            errors,
+        )
+    }
 }
-
-#[cfg(test)]
-mod tests;

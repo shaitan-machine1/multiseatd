@@ -1,0 +1,16 @@
+[package]
+name = "dev-acl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+libc.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

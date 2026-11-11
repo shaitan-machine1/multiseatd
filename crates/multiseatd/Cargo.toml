@@ -6,19 +6,24 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-test-support = ["dev-broker/test-support"]
+default = []
+vt = ["dep:linux-vt"]
+test-support = ["dev-broker/test-support", "dev-acl/test-support", "linux-vt?/test-support"]
 
 [dependencies]
 clap.workspace = true
 hex.workspace = true
 dbus.workspace = true
 dev-broker.workspace = true
+dev-acl.workspace = true
+linux-vt = { workspace = true, optional = true }
+futures-util.workspace = true
 libc.workspace = true
 nix.workspace = true
 rustix.workspace = true
 uuid.workspace = true
 lib-multiseatd.workspace = true
-seat-udev.workspace = true
+seat-udev = { workspace = true, features = ["assign"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true

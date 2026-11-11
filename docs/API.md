@@ -1,105 +1,88 @@
-# Context API v2
+# Per-seat API
 
-Service `org.decoupling.multiseatd2`, object `/org/decoupling/multiseatd2`, interface
-`org.decoupling.multiseatd2.Manager`. The canonical introspection XML is
-[`crates/lib-multiseatd/dbus/org.decoupling.multiseatd2.Manager.xml`](../crates/lib-multiseatd/dbus/org.decoupling.multiseatd2.Manager.xml).
+Bus name: `org.SGLogin.Multiseatd1.Seat_<encoded-seat>`.
+Object: `/org/SGLogin/Multiseatd1`.
+Interface: `org.SGLogin.Multiseatd1.Manager`.
+[Canonical XML](../crates/lib-multiseatd/dbus/org.SGLogin.Multiseatd1.Manager.xml).
 
-## Authority and lifetime
+Seat names begin `seat`, contain only ASCII alphanumerics, underscore or hyphen,
+and are at most 63 bytes. Bare `seat` is valid. Encode every non-alphanumeric byte
+as `_xx` with lowercase hexadecimal: `seat-a_b` becomes `seat_2da_5fb`.
 
-Root creates a context for a ready seat and receives `(authority FD, ContextId)`.
-The FD is a transferable capability, not a protocol socket. Its registered Linux
-SO_COOKIE identity survives dup/fork/SCM_RIGHTS. The opposite endpoint is retained
-for lifetime observation; unrelated sockets, wrong endpoints and previous-daemon
-capabilities fail. IDs/UIDs/FD numbers and SO_PEERCRED are not authority.
+Both builds expose exactly these methods:
 
-Final endpoint close, shutdown or unexpected data irreversibly removes the context.
-Explicit removal invalidates all copies before cleanup. Bus-owner loss alone does
-not remove it. In-flight descriptor copies can extend lifetime; leaked copies can
-be overridden by root ID removal. Bounded tombstones authorize removal retries only.
-Restart invalidates every capability, ID and connection.
+| Method | Input | Output | Authority |
+| --- | --- | --- | --- |
+| CreateContext | `u vt` | `h authority, s id` | root |
+| ActivateContext | `s id` | — | root |
+| DeactivateContext | `s id` | — | root |
+| RemoveContext | `h authority` | — | capability |
+| AddAclGrant | `h authority, u uid` | — | capability |
+| RemoveAclGrant | `h authority, u uid` | — | capability |
+| CreateConnection | `h authority` | `h endpoint, u handle` | capability |
+| GetContext | `h authority` | `(suauaubbb)` | capability |
+| GetSeatMetadata | `h authority` | `s seat, u vt` | capability |
+| RemoveContextById | `s id` | — | root |
+| ListContexts | — | `a(suauaubbb)` | root |
+| MoveToForeground | `s id` | — | root |
+| RemoveUnassignedDevices | — | — | root |
+| AddAssignedDevices | — | — | root |
 
-A holder has full context control, including arbitrary UID registrations and
-activation while inactive. This does not authorize another context or arbitrary
-paths. Trusted controllers may deliberately delegate authority; ordinary compositor
-and greeter application lineages must not retain it.
+IDs are canonical lowercase RFC4122 UUIDv7, not credentials/session IDs. The
+seven record fields are `id`, `vt`, sorted unique desired UIDs, sorted unique
+connection handles, `active`, `foreground`, `effective`. No cleanup/phase/diagnostic
+fields exist. Immutable VT must be in the startup set; non-VT creation accepts
+only zero. Foreground is false at VT zero. Background active contexts retain
+intent but have no applied access. Effective implies active.
 
-## Methods
+Only root selects/clears active associations. Occupied activation, including
+same-ID activation, is Busy before effects. Deactivation retains its association
+until withdrawal succeeds. MoveToForeground requests/observes kernel switching
+without holding State while waiting; it does not activate. Non-VT returns
+InvalidArgument, not a no-op or absent method. Authority-backed removal is
+idempotent through bounded removal-only tombstones; those cannot authorize grants,
+queries or connections after invalidation.
 
-Root only:
+An authority is the exact root-peer Unix stream endpoint registered for a
+context. Duplicates keep it alive until final close; write shutdown or unexpected
+data invalidates it. No endpoint held by the daemon keeps its peer alive. A
+connection is a separate inherited C libseat stream, not authority. Closing one
+connection never removes/deactivates its context or closes a sibling. The SDK's
+local `remove_connection(BorrowedFd)` calls shutdown without closing the borrowed
+FD; ordinary duplicate drop does not shut down the endpoint.
 
-* `CreateContext(s seat) -> (h authority, s context_id)`; no options/VT argument.
-* `ActivateContextById(s)`, `DeactivateContextById(s)`, `RemoveContextById(s)`.
-* `RemoveConnectionById(s)`.
-* `ListSeats() -> a(subssss)`.
-* `ListContexts() -> a(sssauasbbs)`.
-* `ListConnections() -> a(sssss)`.
+`StateChanged(t revision)` is a root-only invalidation hint; query current state.
+Clients pin a root-owned unique bus owner, disable autostart, and reject owner
+replacement. The synchronous SDK has explicit seat routing, borrowed/owned FD
+APIs and manually driven signal subscriptions, without background threads.
 
-Full authority:
+## Assignment refresh
 
-* `ActivateContext(h)`, `DeactivateContext(h)`, `RemoveContext(h)`.
-* `GrantAccess(h, u uid)`, `RevokeAccess(h, u uid)`.
-* `CreateConnection(h) -> (h seatd, s connection_id)`.
-* `RemoveConnection(h, s connection_id)` verifies parent membership.
-* `GetContext(h) -> (sssauasbbs)`.
-* `GetSeatMetadata(h) -> (s seat, u graphical_vt)` discloses no other context IDs.
+The SDK accepts an explicit nonempty unique list of at most 256 seats; it neither
+reads configuration nor discovers participants. Pin owners and attempt removal on
+all reachable participants. An absent seat, removal failure or changed owner
+blocks **all additions**. Only after every removal succeeds and owners are
+rechecked may additions start. Preserve per-seat remote errors, including fatal
+categories; do not retry automatically. Retire/recover an old owner before
+omitting it from configuration. Startup is not a live move.
 
-Seat fields: name, VT (zero means non-VT), settled foreground, selected ID, effective
-ID, transition phase, cleanup diagnostic. Context fields: ID, seat, phase, desired
-UIDs, connection IDs, selected/effective flags, cleanup diagnostic. Connection fields:
-ID, permanent parent context, seat, membership phase, cleanup diagnostic. Empty IDs
-mean none. Desired permissions are not a claim about current effective access.
+## Errors and deadlines
 
-`StateChanged(t revision)` is a private root-visible hint, not authorization or a
-transaction log. Subscribe then query; revisions are daemon-lifetime only. The
-synchronous client's owner-specific subscription must be rebuilt after bus-owner
-change. Notifications are coalesced/bounded and contain no inventory body.
+Prefix `org.SGLogin.Multiseatd1.Error.`:
+`InvalidArgument`, `NotAuthorized`, `NotFound`, `NotReady`, `Busy`,
+`LimitExceeded`, `Pending`, `Stopping`, `DeviceRemovalFailed`,
+`DeviceAdditionFailed`, `VTActivationFailed`, `CriticalFailure`.
 
-Unknown/trailing/mistyped arguments are errors. IDs are canonical lowercase UUIDv4.
-Invalid authority returns AccessDenied without disclosing its former context. A
-foreign connection under a live authority returns UnknownConnection. Unknown valid
-root removal IDs succeed. There is no creator UID, login-session ID or leader PID
-fallback.
+Default SDK call budget is 10 seconds. Server receipt/reply budget is 8 seconds;
+required effects share a cumulative maximum 6 seconds, shortened by admission
+waits to preserve 1 second reply headroom. An operation needs at least 100ms
+remaining effect window before starting. Kernel disable ACK deadline is 2 seconds.
+Critical reply flush is bounded at 500ms, before best-effort cleanup (5 seconds).
+An independent native watchdog fences stalled-runtime effects and bounds exit.
 
-## Completion and errors
-
-Errors use `org.decoupling.multiseatd2.Error.` with InvalidArgument, AccessDenied,
-UnknownSeat, UnknownContext, UnknownConnection, ContextRemoving, ResourceConflict,
-LimitExceeded, TransitionPending, CleanupPending or BackendFailure.
-
-A successful transition confirms its resource and delivery barriers, not queued
-intent. A ten-second server response-wait budget does not cancel admitted work;
-query state after timeout/pending errors. Two-second disable deadlines are separate.
-Revocation removes desired permission before cleanup. Failed active addition removes
-its new desired UID and compensates uncertain writes; it is not silently retried as
-a desired grant. Removal/cleanup is irreversible and may remain pending on driver
-failure. No context operation terminates application processes.
-
-## Client and launch usage
-
-`libmultiseatd::Client` uses dbus::blocking directly. Authority arguments are borrowed;
-owned CLOEXEC duplicates are sent. Returned descriptors are owned, CLOEXEC and at
-least FD 3. There are no async features, executors, adapters or hidden worker threads.
-
-```rust,no_run
-use libmultiseatd::Client;
-use std::{os::fd::AsFd, time::Duration};
-let client = Client::system(Duration::from_secs(11))?;
-let context = client.create_context("seat0")?; // root
-client.grant_access(context.as_fd(), 1000)?;
-client.activate_context(context.as_fd())?;
-let connection = client.create_connection(context.as_fd())?;
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-A trusted, already credential-dropped/detached worker execs seat-launch using an
-explicit inherited `MULTISEATD_AUTHORITY_FD` (or `--authority-fd`). Safe standard
-streams/PTYs are permitted; Linux VT/control-terminal inheritance is rejected.
-Only the new seatd FD survives ordinary-app exec. Exec failure closes that connection,
-not its context, siblings or registrations. Do not delegate authority through
-untrusted loader environment, shell startup hooks or unrelated helpers.
-
-Internal admission bounds: 256 ready seats/retained contexts globally, 64 contexts
-per seat, 64 connections/context and 4096 globally, 64 UID registrations/context,
-128 open records/connection and 4096 authority retry tombstones. Pending/removing
-objects count until actual cleanup; all control/output/resource queues are bounded.
-See [behavior](BEHAVIOR.md) for kernel and same-UID isolation limits.
+Ordinary rejection precedes irreversible work. Unexpected required effect failure,
+including timeout/panic, fences before unlock, attempts CriticalFailure and exits
+nonzero after bounded cleanup. No rollback or completed revocation is claimed.
+Reply expiry/disconnect does not cancel admitted parent-owned work; expired
+unadmitted lock waits never mutate later. Pending is not successful teardown and
+must never authorize a successor login.

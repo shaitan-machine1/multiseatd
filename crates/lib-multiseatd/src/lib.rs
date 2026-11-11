@@ -1,16 +1,20 @@
-//! Synchronous capability-based multiseatd v2 client. No executor or worker thread.
+//! Explicitly routed synchronous clients. No executor, background thread or autostart.
 pub mod contract;
 mod id;
 pub mod launch;
+mod refresh;
 pub use contract::{
-    BUS_NAME, ConnectionRow, ContextRow, ErrorKind, INTERFACE_NAME, INTROSPECTION, OBJECT_PATH,
-    SeatRow,
+    ContextInfo, DEFAULT_TIMEOUT, ErrorKind, INTERFACE_NAME, INTROSPECTION, OBJECT_PATH, bus_name,
 };
-pub use id::{ConnectionId, ContextId, InvalidId};
+pub use id::{ContextId, InvalidId};
+pub use refresh::{
+    RefreshError, RefreshStage, SeatFailure, refresh_devices, refresh_devices_with_timeout,
+};
 
-use dbus::blocking::{Connection, Proxy};
-use std::os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::time::Duration;
+use dbus::arg::{AppendAll, ReadAll};
+use dbus::blocking::{BlockingSender, Connection};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub struct Context {
@@ -29,7 +33,7 @@ impl Context {
 }
 #[derive(Debug)]
 pub struct SeatConnection {
-    pub id: ConnectionId,
+    pub handle: u32,
     descriptor: OwnedFd,
 }
 impl AsFd for SeatConnection {
@@ -46,153 +50,178 @@ impl SeatConnection {
 pub struct Client {
     connection: Connection,
     timeout: Duration,
+    seat: String,
+    name: String,
+    owner: String,
 }
 impl Client {
-    pub fn system(timeout: Duration) -> Result<Self, dbus::Error> {
+    pub fn system(seat: &str) -> Result<Self, dbus::Error> {
+        Self::system_with_timeout(seat, DEFAULT_TIMEOUT)
+    }
+    pub fn system_with_timeout(seat: &str, timeout: Duration) -> Result<Self, dbus::Error> {
+        validate(seat, timeout)?;
+        Self::from_connection(Connection::new_system()?, seat, timeout)
+    }
+    /// Explicit private-bus/test integration. Never changes the process environment.
+    pub fn for_address(address: &str, seat: &str, timeout: Duration) -> Result<Self, dbus::Error> {
+        validate(seat, timeout)?;
+        let mut channel = dbus::channel::Channel::open_private(address)?;
+        channel.register()?;
+        Self::from_connection(channel.into(), seat, timeout)
+    }
+    pub fn from_connection(
+        connection: Connection,
+        seat: &str,
+        timeout: Duration,
+    ) -> Result<Self, dbus::Error> {
+        let name = validate(seat, timeout)?;
+        let deadline = Instant::now() + timeout;
+        let (owner,): (String,) =
+            bus_call(&connection, remaining(deadline)?, "GetNameOwner", (&name,))?;
+        if !owner.starts_with(':') {
+            return Err(ErrorKind::NotAuthorized.error("invalid unique bus owner"));
+        }
+        let (uid,): (u32,) = bus_call(
+            &connection,
+            remaining(deadline)?,
+            "GetConnectionUnixUser",
+            (&owner,),
+        )?;
+        if uid != 0 {
+            return Err(ErrorKind::NotAuthorized.error("seat service is not root-owned"));
+        }
         Ok(Self {
-            connection: Connection::new_system()?,
+            connection,
             timeout,
+            seat: seat.into(),
+            name,
+            owner,
         })
     }
-    pub fn session(timeout: Duration) -> Result<Self, dbus::Error> {
-        Ok(Self {
-            connection: Connection::new_session()?,
-            timeout,
-        })
+    pub fn seat(&self) -> &str {
+        &self.seat
+    }
+    pub fn owner(&self) -> &str {
+        &self.owner
     }
     pub fn connection(&self) -> &Connection {
         &self.connection
     }
-    fn proxy(&self) -> Proxy<'_, &Connection> {
-        self.connection
-            .with_proxy(BUS_NAME, OBJECT_PATH, self.timeout)
+    pub fn verify_owner(&self) -> Result<(), dbus::Error> {
+        self.verify_owner_until(Instant::now() + self.timeout)
     }
-    pub fn create_context(&self, seat: &str) -> Result<Context, dbus::Error> {
-        let (fd, id): (dbus::arg::OwnedFd, String) =
-            self.proxy()
-                .method_call(INTERFACE_NAME, "CreateContext", (seat,))?;
+    fn verify_owner_until(&self, deadline: Instant) -> Result<(), dbus::Error> {
+        let (current,): (String,) = bus_call(
+            &self.connection,
+            remaining(deadline)?,
+            "GetNameOwner",
+            (&self.name,),
+        )?;
+        if current != self.owner {
+            return Err(
+                ErrorKind::NotReady.error("seat service owner changed; create a new client")
+            );
+        }
+        Ok(())
+    }
+    fn call<A: AppendAll, R: ReadAll>(&self, method: &str, args: A) -> Result<R, dbus::Error> {
+        let deadline = Instant::now() + self.timeout;
+        self.verify_owner_until(deadline)?;
+        let mut message =
+            dbus::Message::new_method_call(&self.owner, OBJECT_PATH, INTERFACE_NAME, method)
+                .map_err(|error| dbus::Error::new_failed(&error))?;
+        message.set_auto_start(false);
+        message.append_all(args);
+        // Preserve the actual remote error category/message, including CriticalFailure.
+        self.connection
+            .send_with_reply_and_block(message, remaining(deadline)?)?
+            .read_all()
+    }
+    pub fn create_context(&self, vt: u32) -> Result<Context, dbus::Error> {
+        let (fd, text): (dbus::arg::OwnedFd, String) = self.call("CreateContext", (vt,))?;
+        let id = text
+            .parse()
+            .map_err(|error: InvalidId| dbus::Error::new_failed(&error.to_string()))?;
         Ok(Context {
-            id: parse(&id)?,
+            id,
             authority: received(fd)?,
         })
     }
-    pub fn activate_context(&self, authority: BorrowedFd<'_>) -> Result<(), dbus::Error> {
-        self.authority_call("ActivateContext", authority)
+    pub fn activate_context(&self, id: ContextId) -> Result<(), dbus::Error> {
+        self.id_call("ActivateContext", id)
     }
-    pub fn deactivate_context(&self, authority: BorrowedFd<'_>) -> Result<(), dbus::Error> {
-        self.authority_call("DeactivateContext", authority)
+    pub fn deactivate_context(&self, id: ContextId) -> Result<(), dbus::Error> {
+        self.id_call("DeactivateContext", id)
+    }
+    pub fn move_to_foreground(&self, id: ContextId) -> Result<(), dbus::Error> {
+        self.id_call("MoveToForeground", id)
+    }
+    pub fn remove_context_by_id(&self, id: ContextId) -> Result<(), dbus::Error> {
+        self.id_call("RemoveContextById", id)
+    }
+    fn id_call(&self, method: &str, id: ContextId) -> Result<(), dbus::Error> {
+        self.call(method, (id.to_string(),))
     }
     pub fn remove_context(&self, authority: BorrowedFd<'_>) -> Result<(), dbus::Error> {
-        self.authority_call("RemoveContext", authority)
+        self.call("RemoveContext", (argument(authority)?,))
     }
-    fn authority_call(&self, method: &str, authority: BorrowedFd<'_>) -> Result<(), dbus::Error> {
-        self.proxy()
-            .method_call(INTERFACE_NAME, method, (argument(authority)?,))
+    pub fn add_acl_grant(&self, authority: BorrowedFd<'_>, uid: u32) -> Result<(), dbus::Error> {
+        self.call("AddAclGrant", (argument(authority)?, uid))
     }
-    pub fn grant_access(&self, authority: BorrowedFd<'_>, uid: u32) -> Result<(), dbus::Error> {
-        self.proxy()
-            .method_call(INTERFACE_NAME, "GrantAccess", (argument(authority)?, uid))
-    }
-    pub fn revoke_access(&self, authority: BorrowedFd<'_>, uid: u32) -> Result<(), dbus::Error> {
-        self.proxy()
-            .method_call(INTERFACE_NAME, "RevokeAccess", (argument(authority)?, uid))
+    pub fn remove_acl_grant(&self, authority: BorrowedFd<'_>, uid: u32) -> Result<(), dbus::Error> {
+        self.call("RemoveAclGrant", (argument(authority)?, uid))
     }
     pub fn create_connection(
         &self,
         authority: BorrowedFd<'_>,
     ) -> Result<SeatConnection, dbus::Error> {
-        let (fd, id): (dbus::arg::OwnedFd, String) = self.proxy().method_call(
-            INTERFACE_NAME,
-            "CreateConnection",
-            (argument(authority)?,),
-        )?;
+        let (fd, handle): (dbus::arg::OwnedFd, u32) =
+            self.call("CreateConnection", (argument(authority)?,))?;
+        if handle > i32::MAX as u32 {
+            return Err(dbus::Error::new_failed("invalid connection handle"));
+        }
         Ok(SeatConnection {
-            id: parse(&id)?,
+            handle,
             descriptor: received(fd)?,
         })
     }
-    pub fn remove_connection(
-        &self,
-        authority: BorrowedFd<'_>,
-        id: ConnectionId,
-    ) -> Result<(), dbus::Error> {
-        self.proxy().method_call(
-            INTERFACE_NAME,
-            "RemoveConnection",
-            (argument(authority)?, id.to_string()),
-        )
-    }
-    /// Only this context's seat name/VT metadata, never another context's IDs.
     pub fn seat_metadata(&self, authority: BorrowedFd<'_>) -> Result<(String, u32), dbus::Error> {
-        self.proxy()
-            .method_call(INTERFACE_NAME, "GetSeatMetadata", (argument(authority)?,))
+        let metadata: (String, u32) = self.call("GetSeatMetadata", (argument(authority)?,))?;
+        if metadata.0 != self.seat || metadata.1 > 63 {
+            return Err(dbus::Error::new_failed("invalid or wrong-seat metadata"));
+        }
+        Ok(metadata)
     }
-    pub fn get_context(&self, authority: BorrowedFd<'_>) -> Result<ContextRow, dbus::Error> {
-        let (row,): (ContextRow,) =
-            self.proxy()
-                .method_call(INTERFACE_NAME, "GetContext", (argument(authority)?,))?;
-        Ok(row)
+    pub fn get_context(&self, authority: BorrowedFd<'_>) -> Result<ContextInfo, dbus::Error> {
+        let (info,) = self.call("GetContext", (argument(authority)?,))?;
+        Ok(info)
     }
-    pub fn activate_context_by_id(&self, id: ContextId) -> Result<(), dbus::Error> {
-        self.id_call("ActivateContextById", &id.to_string())
+    pub fn list_contexts(&self) -> Result<Vec<ContextInfo>, dbus::Error> {
+        let (contexts,) = self.call("ListContexts", ())?;
+        Ok(contexts)
     }
-    pub fn deactivate_context_by_id(&self, id: ContextId) -> Result<(), dbus::Error> {
-        self.id_call("DeactivateContextById", &id.to_string())
+    pub fn remove_unassigned_devices(&self) -> Result<(), dbus::Error> {
+        self.call("RemoveUnassignedDevices", ())
     }
-    pub fn remove_context_by_id(&self, id: ContextId) -> Result<(), dbus::Error> {
-        self.id_call("RemoveContextById", &id.to_string())
+    pub fn add_assigned_devices(&self) -> Result<(), dbus::Error> {
+        self.call("AddAssignedDevices", ())
     }
-    pub fn remove_connection_by_id(&self, id: ConnectionId) -> Result<(), dbus::Error> {
-        self.id_call("RemoveConnectionById", &id.to_string())
-    }
-    fn id_call(&self, method: &str, id: &str) -> Result<(), dbus::Error> {
-        self.proxy().method_call(INTERFACE_NAME, method, (id,))
-    }
-    pub fn list_seats(&self) -> Result<Vec<SeatRow>, dbus::Error> {
-        let (rows,): (Vec<SeatRow>,) = self.proxy().method_call(INTERFACE_NAME, "ListSeats", ())?;
-        Ok(rows)
-    }
-    pub fn list_contexts(&self) -> Result<Vec<ContextRow>, dbus::Error> {
-        let (rows,): (Vec<ContextRow>,) =
-            self.proxy()
-                .method_call(INTERFACE_NAME, "ListContexts", ())?;
-        Ok(rows)
-    }
-    pub fn list_connections(&self) -> Result<Vec<ConnectionRow>, dbus::Error> {
-        let (rows,): (Vec<ConnectionRow>,) =
-            self.proxy()
-                .method_call(INTERFACE_NAME, "ListConnections", ())?;
-        Ok(rows)
-    }
-    pub fn owner(&self) -> Result<String, dbus::Error> {
-        let (owner,): (String,) = self
-            .connection
-            .with_proxy(
-                "org.freedesktop.DBus",
-                "/org/freedesktop/DBus",
-                self.timeout,
-            )
-            .method_call("org.freedesktop.DBus", "GetNameOwner", (BUS_NAME,))?;
-        Ok(owner)
-    }
-    /// Install before querying inventory. Drive callbacks explicitly with process;
-    /// restart invalidates this owner-specific subscription and all old handles.
+    /// Root-only coalesced requery hints. The caller explicitly drives process().
     pub fn subscribe(
         &self,
         mut callback: impl FnMut(u64) + Send + 'static,
     ) -> Result<dbus::channel::Token, dbus::Error> {
-        let owner = self.owner()?;
+        self.verify_owner()?;
         let rule = dbus::message::MatchRule::new_signal(INTERFACE_NAME, "StateChanged")
             .with_path(OBJECT_PATH)
-            .with_sender(owner);
+            .with_sender(self.owner.clone());
         let token = self
             .connection
             .add_match(rule, move |(revision,): (u64,), _, _| {
                 callback(revision);
                 true
             })?;
-        // Authenticate/register this unique root peer for private signal delivery.
-        if let Err(error) = self.list_seats() {
+        if let Err(error) = self.list_contexts() {
             let _ = self.connection.remove_match(token);
             return Err(error);
         }
@@ -202,16 +231,58 @@ impl Client {
         self.connection.process(timeout)
     }
 }
-fn parse<T: std::str::FromStr<Err = InvalidId>>(text: &str) -> Result<T, dbus::Error> {
-    text.parse()
-        .map_err(|error| dbus::Error::new_failed(&format!("invalid daemon ID: {error}")))
+
+/// Local endpoint shutdown only. This neither closes the borrowed FD nor attests remote revocation.
+pub fn remove_connection(fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    if unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) } == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+fn validate(seat: &str, timeout: Duration) -> Result<String, dbus::Error> {
+    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+        return Err(
+            ErrorKind::InvalidArgument.error("timeout must be positive and at most one hour")
+        );
+    }
+    bus_name(seat).map_err(|error| ErrorKind::InvalidArgument.error(&error.to_string()))
+}
+fn remaining(deadline: Instant) -> Result<Duration, dbus::Error> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| {
+            dbus::Error::new_custom(
+                "org.freedesktop.DBus.Error.Timeout",
+                "client operation deadline expired",
+            )
+        })
+}
+fn bus_call<A: AppendAll, R: ReadAll>(
+    connection: &Connection,
+    timeout: Duration,
+    method: &str,
+    args: A,
+) -> Result<R, dbus::Error> {
+    let mut message = dbus::Message::new_method_call(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        method,
+    )
+    .map_err(|error| dbus::Error::new_failed(&error))?;
+    message.set_auto_start(false);
+    message.append_all(args);
+    connection
+        .send_with_reply_and_block(message, timeout)?
+        .read_all()
 }
 fn argument(fd: BorrowedFd<'_>) -> Result<dbus::arg::OwnedFd, dbus::Error> {
-    let duplicate = duplicate(fd).map_err(|error| dbus::Error::new_failed(&error.to_string()))?;
-    Ok(unsafe { dbus::arg::OwnedFd::from_raw_fd(duplicate.into_raw_fd()) })
+    let fd = duplicate(fd).map_err(|e| dbus::Error::new_failed(&e.to_string()))?;
+    Ok(unsafe { dbus::arg::OwnedFd::from_raw_fd(fd.into_raw_fd()) })
 }
 fn duplicate(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
-    use std::os::fd::AsRawFd;
     let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
     if raw < 0 {
         Err(std::io::Error::last_os_error())
@@ -220,6 +291,69 @@ fn duplicate(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
     }
 }
 fn received(fd: dbus::arg::OwnedFd) -> Result<OwnedFd, dbus::Error> {
-    let received = unsafe { OwnedFd::from_raw_fd(fd.into_raw_fd()) };
-    duplicate(received.as_fd()).map_err(|error| dbus::Error::new_failed(&error.to_string()))
+    let fd = unsafe { OwnedFd::from_raw_fd(fd.into_raw_fd()) };
+    let fd = duplicate(fd.as_fd()).map_err(|e| dbus::Error::new_failed(&e.to_string()))?;
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result == -1 || length as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(dbus::Error::new_failed(
+            "returned FD is not a credential-bearing local socket",
+        ));
+    }
+    let credentials = unsafe { credentials.assume_init() };
+    let mut kind = 0i32;
+    let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut i32).cast(),
+            &mut length,
+        )
+    };
+    if result == -1 || kind != libc::SOCK_STREAM || credentials.uid != 0 || credentials.pid <= 0 {
+        return Err(dbus::Error::new_failed(
+            "returned FD is not a root-peer stream socket",
+        ));
+    }
+    Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    #[test]
+    fn local_shutdown_affects_duplicates_but_does_not_close_borrowed_fd() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let other = socket.try_clone().unwrap();
+        remove_connection(socket.as_fd()).unwrap();
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        assert!(unsafe { libc::fcntl(other.as_raw_fd(), libc::F_GETFD) } >= 0);
+        assert!(unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+    #[test]
+    fn closing_only_a_parent_copy_keeps_child_endpoint_alive() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let other = socket.try_clone().unwrap();
+        drop(socket);
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(other);
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
 }

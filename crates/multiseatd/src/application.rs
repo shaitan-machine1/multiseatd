@@ -1,455 +1,457 @@
-//! Executable lifecycle and bounded control-plane routing.
-
-use crate::daemon::{CriticalRole, Daemon, ShutdownPhase, ShutdownSignals};
-use crate::dbus::{
-    manager,
-    reactor::{BusIo, error_reply},
+//! Explicit owners, direct source wiring and bounded all-context shutdown.
+use crate::{
+    daemon::{ShutdownSignals, Watchdog},
+    dbus::reactor::BusIo,
+    discovery,
+    fatal::{self, Fatal},
+    seat::Seat,
+    sources::{self, BrokerWork, ControlWork, SequentialWork},
 };
-use crate::registry::{Limits, Registry};
-use crate::resources::{CleanupGuard, Resources};
-use crate::seat::policy::Policy;
-use crate::seat::{Budget, Command, Controller, Port};
-use crate::topology::Snapshot;
-use crate::topology_transaction;
-use libmultiseatd::ContextId;
-use libmultiseatd::contract::ErrorKind;
-use seat_udev::{Context, SeatName};
-use std::collections::{BTreeMap, BTreeSet};
-use std::io;
-use std::os::fd::OwnedFd;
-use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
-use tokio::sync::oneshot;
-use tokio::task::JoinSet;
-use tokio::time::{Duration, Instant, interval, timeout};
+use dev_broker::{broker::Broker, resources::Resources};
+use futures_util::{FutureExt, StreamExt, future::LocalBoxFuture};
+use seat_udev::SeatName;
+use std::{io, panic::AssertUnwindSafe, sync::Arc};
+use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::time::{Duration, Instant, sleep_until};
 
 pub struct Configuration {
-    pub session_bus: bool,
-    pub test_only: bool,
-    pub non_vt_only: bool,
-    pub graphical_vt: Option<u32>,
-    pub test_seats: Vec<SeatName>,
-    pub test_direct_nodes: Vec<PathBuf>,
-    pub test_null_device: bool,
+    pub seat: SeatName,
+    pub bus_address: Option<String>,
+    pub fixture: Option<discovery::Fixture>,
+    #[cfg(feature = "test-support")]
+    pub acl_fault: Option<dev_acl::TestFault>,
+    #[cfg(feature = "vt")]
+    pub vts: std::collections::BTreeSet<u32>,
+}
+#[cfg(feature = "vt")]
+macro_rules! select_sources { ([$($base:tt)*] [$($native:tt)*]) => { tokio::select! { $($base)* $($native)* } }; }
+#[cfg(not(feature = "vt"))]
+macro_rules! select_sources { ([$($base:tt)*] [$($native:tt)*]) => { tokio::select! { $($base)* } }; }
+type Driver = Option<LocalBoxFuture<'static, io::Result<()>>>;
+async fn drive(owner: &mut Driver) -> io::Result<()> {
+    let result = owner.as_mut().expect("active native driver").await;
+    *owner = None;
+    result
+}
+async fn sequential(slot: &mut SequentialWork<'_>) -> fatal::Result<()> {
+    let result = slot.as_mut().expect("retained source operation").await;
+    *slot = None;
+    result
+}
+fn driver(future: impl std::future::Future<Output = io::Result<()>> + 'static) -> Driver {
+    Some(
+        async move {
+            AssertUnwindSafe(future)
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(io::Error::other("critical driver panicked")))
+        }
+        .boxed_local(),
+    )
+}
+fn failed(fatal: &Fatal, role: &str, error: impl std::fmt::Display) {
+    fatal.fail(format!("{role}: {error}"));
 }
 
 pub async fn run(config: Configuration, signals: &ShutdownSignals) -> io::Result<()> {
-    let resources = Arc::new(Resources::new(16384, 16384)?);
-    let _cleanup = CleanupGuard(resources.clone());
-    let mut context = if config.test_only {
-        None
-    } else {
-        Some(Context::new().map_err(io::Error::other)?)
-    };
-    let mut initial = if let Some(context) = &context {
-        filtered(
-            Snapshot::from_context(context, &[])?,
-            config.non_vt_only,
-            config.graphical_vt,
-        )?
-    } else {
-        if config.test_seats.is_empty() || config.test_seats.contains(&SeatName::seat0()) {
-            return Err(io::Error::other("test mode requires explicit non-VT seats"));
-        }
-        Snapshot {
-            seats: config.test_seats.iter().cloned().collect(),
-            direct: BTreeMap::from([(
-                config.test_seats[0].clone(),
-                config.test_direct_nodes.iter().cloned().collect(),
-            )]),
-            ..Snapshot::default()
+    #[cfg(feature = "test-support")]
+    if config.acl_fault.is_some() && config.fixture.is_none() {
+        return Err(io::Error::other(
+            "ACL fault injection requires a disposable fixture backend",
+        ));
+    }
+    let workers = Arc::new(Semaphore::new(4));
+    let resources = Arc::new(Resources::new(4096)?);
+    let (broker, control, broker_events) = Broker::new(
+        config.seat.as_str().into(),
+        config.fixture.is_some(),
+        resources.clone(),
+        workers.clone(),
+    );
+    let fatal = Fatal::new(control.clone());
+    let watchdog = Watchdog::start(fatal.clone())?;
+    let mut discovery = match discovery::Owner::start(config.fixture, fatal.clone()) {
+        Ok(owner) => owner,
+        Err(error) => {
+            failed(&fatal, "discovery startup", &error);
+            return Err(error);
         }
     };
-    if config.test_only {
-        for path in &config.test_direct_nodes {
-            if !std::fs::symlink_metadata(path)?.file_type().is_file() {
-                return Err(io::Error::other("test ACL fixtures must be regular files"));
-            }
+    let discovery_events = discovery.take_events()?;
+    #[cfg(feature = "vt")]
+    let mut terminal = match linux_vt::Owner::claim_all(&config.vts) {
+        Ok(owner) => owner,
+        Err(error) => {
+            failed(&fatal, "native terminal startup", &error);
+            abort_startup(&mut discovery, None).await;
+            return Err(error);
+        }
+    };
+    #[cfg(feature = "vt")]
+    {
+        let end = Instant::now() + fatal::EFFECT_LIMIT;
+        let token = fatal.begin_effect(end);
+        let result = tokio::time::timeout_at(end, terminal.ready()).await;
+        fatal.end_effect(token);
+        let result = result
+            .map_err(|_| io::Error::other("native startup claim deadline expired"))
+            .and_then(|result| result);
+        if result.is_err() || fatal.failed() {
+            let error = result
+                .err()
+                .unwrap_or_else(|| io::Error::other("independent startup claim watchdog expired"));
+            failed(&fatal, "native terminal readiness", &error);
+            abort_startup(&mut discovery, Some(&mut terminal)).await;
+            return Err(error);
         }
     }
-    if config.test_null_device {
-        if !config.test_only || !cfg!(feature = "test-support") {
-            return Err(io::Error::other(
-                "synthetic device requires test-only and test-support",
-            ));
-        }
-        use std::os::unix::fs::MetadataExt;
-        initial.brokered.insert(
-            config.test_seats[0].clone(),
-            vec![crate::device::AllowedDevice::canonicalized(
-                crate::device::DeviceId::new("test-only:null"),
-                "/dev/null",
-                std::fs::metadata("/dev/null")?.rdev(),
-                crate::device::DeviceKind::Evdev,
-            )?],
-        );
-    }
-    // Stale named-user ACLs must be cleared before controllers/name publication.
-    let initial = topology_transaction::initialize(resources.clone(), initial).await?;
-    let mut policies = initial.policies;
-    let initial = initial.snapshot;
-    let mut paused = BTreeSet::new();
-    let mut daemon = Daemon::new(
-        Registry::new(Limits::default()).map_err(io::Error::other)?,
-        258,
-    )
-    .map_err(io::Error::other)?;
-    let mut vt_owner = if let Some(terminal) = config.graphical_vt {
-        if config.test_only {
-            return Err(io::Error::other(
-                "synthetic fixtures cannot claim a real VT",
-            ));
-        }
-        Some(
-            crate::vt::Owner::start(
-                terminal,
-                resources.clone(),
-                initial.seats.contains(&SeatName::seat0()),
+    #[cfg(feature = "vt")]
+    let vt_control = terminal.control();
+    #[cfg(feature = "vt")]
+    let vt_notices = terminal.take_notices()?;
+    let seat = match Seat::new(
+        config.seat.clone(),
+        control.clone(),
+        discovery.control(),
+        fatal.clone(),
+        workers,
+        #[cfg(feature = "vt")]
+        vt_control.clone(),
+        #[cfg(feature = "vt")]
+        config.vts,
+    ) {
+        Ok(seat) => seat,
+        Err(error) => {
+            failed(&fatal, "seat construction", &error);
+            abort_startup(
+                &mut discovery,
+                #[cfg(feature = "vt")]
+                Some(&mut terminal),
             )
-            .await?,
-        )
-    } else {
-        None
+            .await;
+            return Err(error);
+        }
     };
-    let vt = vt_owner.as_ref().map(crate::vt::Owner::port);
-    if let Some(port) = vt.clone() {
-        let mut shutdown = daemon.subscribe();
-        daemon.spawn(CriticalRole::VtOwner, async move {
-            tokio::select! { biased; _ = shutdown.reached(ShutdownPhase::RestoreTerminal) => Ok(()), failure = port.failed() => failure }
-        }).map_err(io::Error::other)?;
+    #[cfg(feature = "test-support")]
+    if let Some(fault) = config.acl_fault {
+        seat.inject_acl_fault(fault)?;
     }
-    let budget = Budget::default();
-    let mut seats = BTreeMap::new();
-    add_seats(
-        &initial,
-        &mut daemon,
-        &mut seats,
-        &resources,
-        &budget,
-        &policies,
-        vt.as_ref(),
-    )?;
-    let watched = context
-        .as_ref()
-        .map(|context| {
-            let fd = context.monitor_fd().try_clone_to_owned()?;
-            // SAFETY: owned duplicate stays open/unchanged until watch destruction.
-            unsafe { AsyncFd::register(fd) }.map_err(io::Error::from)
-        })
-        .transpose()?;
-    let (bus, mut incoming, replies) = BusIo::connect(config.session_bus)?;
-    let (ready, started) = oneshot::channel();
-    daemon
-        .spawn(CriticalRole::Bus, bus.run(daemon.subscribe(), ready))
-        .map_err(io::Error::other)?;
-    let mut requests = JoinSet::new();
-    let mut removals = JoinSet::new();
-    let mut removing = BTreeSet::new();
-    let mut removal_retry = BTreeMap::new();
-    let mut retiring = BTreeSet::new();
-    let mut stopped = BTreeSet::new();
-    let mut topology = JoinSet::new();
-    let mut desired = None;
-    let mut generation = 0u64;
-    let mut prepared_generation = 0u64;
-    let mut prepared = initial;
-    let mut revision = 0u64;
-    let mut inventory = Vec::new();
-    let mut retry = interval(Duration::from_millis(100));
-    let mut audit = interval(Duration::from_secs(1));
-    // startup notification is diagnostic; service failure is always supervised.
-    tokio::pin!(started);
-    let mut startup_observed = false;
-    let result: io::Result<()> = async {
-        loop {
-            queue_removals(&mut daemon, &seats, &mut removing, &mut removal_retry, &mut removals);
-            for name in &retiring {
-                if topology.is_empty() && desired.is_none() && !stopped.contains(name) && !daemon.registry().removals().any(|(_, seat)| seat == name)
-                    && let Some(port) = seats.get(name)
+    let mut broker_driver = driver(broker.run());
+    let mut bus_driver = None;
+    let (stop_bus, stopping_bus) = watch::channel(false);
+    let mut startup = Some(sources::operation(&seat, seat.initialize()));
+    let mut controls = ControlWork::new();
+    let mut broker_work = BrokerWork::new();
+    let mut udev_work = None;
+    #[cfg(feature = "vt")]
+    let mut vt_work = None;
+    let mut broker_done = false;
+    // Startup remains parent-owned even if an independent owner fails first.
+    tokio::select! {
+        result = sequential(&mut startup) => if let Err(error) = result { failed(&fatal, "initial inventory", error); },
+        result = drive(&mut broker_driver) => { broker_done = result.is_ok(); failed(&fatal, "startup broker exit", result.err().map_or_else(|| "unexpected normal exit".into(), |error| error.to_string())); },
+        _ = fatal.wait_stopping() => {},
+        result = signals.requested() => match result { Ok(_) => fatal.stop(), Err(error) => failed(&fatal, "shutdown signal owner", error) },
+    }
+    if !fatal.stopping() {
+        match BusIo::connect(
+            libmultiseatd::bus_name(config.seat.as_str()).map_err(io::Error::other)?,
+            config.bus_address.as_deref(),
+            fatal.clone(),
+        ) {
+            Err(error) => failed(&fatal, "D-Bus connection", error),
+            Ok((bus, requests, replies)) => {
+                // The parent retains the output port through reply/cleanup
+                // barriers even when capture exits with no pending callers.
+                let _reply_owner = replies.clone();
+                let (ready, _ready_receiver) = oneshot::channel();
+                bus_driver = driver(bus.run(stopping_bus, ready));
+                // Adapter futures borrow parent-owned work storage. Dropping a
+                // failed capture future never discards an admitted operation.
                 {
-                    daemon.retire_seat(name);
-                    if port.send(Command::Stop).is_ok() { stopped.insert(name.clone()); }
+                    let control_source = AssertUnwindSafe(sources::run_control(
+                        &seat,
+                        requests,
+                        replies,
+                        &mut controls,
+                    ))
+                    .catch_unwind();
+                    let udev_source = AssertUnwindSafe(sources::run_udev(
+                        &seat,
+                        discovery_events,
+                        &mut udev_work,
+                    ))
+                    .catch_unwind();
+                    let broker_source = AssertUnwindSafe(sources::run_broker(
+                        &seat,
+                        &control,
+                        broker_events,
+                        &mut broker_work,
+                    ))
+                    .catch_unwind();
+                    #[cfg(feature = "vt")]
+                    let vt_source =
+                        AssertUnwindSafe(sources::run_vt(&seat, vt_notices, &mut vt_work))
+                            .catch_unwind();
+                    tokio::pin!(control_source, udev_source, broker_source);
+                    #[cfg(feature = "vt")]
+                    tokio::pin!(vt_source);
+                    select_sources! {[
+                        result = &mut control_source => failed(&fatal, "control adapter", source_result(result)),
+                        result = &mut udev_source => failed(&fatal, "udev adapter", source_result(result)),
+                        result = &mut broker_source => failed(&fatal, "broker adapter", source_result(result)),
+                        result = drive(&mut broker_driver) => { broker_done = result.is_ok(); failed(&fatal, "broker driver", result.err().map_or_else(|| "unexpected normal exit".into(), |error| error.to_string())); },
+                        result = drive(&mut bus_driver) => failed(&fatal, "D-Bus driver", result.err().map_or_else(|| "unexpected normal exit".into(), |error| error.to_string())),
+                        _ = fatal.wait_stopping() => {},
+                        result = signals.requested() => match result { Ok(_) => fatal.stop(), Err(error) => failed(&fatal, "shutdown signal owner", error) },
+                    ] [result = &mut vt_source => failed(&fatal, "VT adapter", source_result(result)),]}
                 }
-            }
-            if topology.is_empty() && let Some((revision, snapshot)) = desired.take() {
-                let resources = resources.clone();
-                let previous = policies.clone();
-                let ports = seats.clone();
-                let touched = paused.clone();
-                let shutdown = daemon.subscribe();
-                let terminal = vt.clone();
-                topology.spawn(async move { (revision, topology_transaction::reconcile(resources, snapshot, previous, ports, touched, shutdown, terminal).await) });
-            }
-            tokio::select! {
-                biased;
-                signal = signals.requested() => { signal?; break Ok(()) },
-                event = daemon.changed() => {
-                    if let Some(exit) = event? {
-                        if let Some(failure) = exit.failure { break Err(io::Error::other(failure)) }
-                        if let CriticalRole::Seat(name) = exit.role {
-                            seats.remove(&name); retiring.remove(&name); stopped.remove(&name);
-                        }
-                    }
+                drain_and_cleanup(
+                    &seat,
+                    &fatal,
+                    &mut discovery,
+                    &mut broker_driver,
+                    &mut bus_driver,
+                    stop_bus,
+                    &resources,
+                    &mut controls,
+                    &mut broker_work,
+                    &mut startup,
+                    &mut udev_work,
+                    #[cfg(feature = "vt")]
+                    &mut vt_work,
+                    #[cfg(feature = "vt")]
+                    &mut terminal,
+                    #[cfg(feature = "vt")]
+                    &vt_control,
+                    &mut broker_done,
+                )
+                .await?;
+                if fatal.failed() {
+                    return Err(io::Error::other(
+                        fatal
+                            .reason()
+                            .unwrap_or_else(|| "fatal seat failure".into()),
+                    ));
                 }
-                joined = removals.join_next(), if !removals.is_empty() => {
-                    let (id, result) = joined.expect("nonempty removal set").map_err(io::Error::other)?;
-                    removing.remove(&id);
-                    if result.is_ok() {
-                        daemon.registry_mut().complete_removal(id);
-                        removal_retry.remove(&id);
-                    } else {
-                        removal_retry.insert(id, Instant::now() + Duration::from_secs(1));
-                    }
-                }
-                joined = requests.join_next(), if !requests.is_empty() => { joined.expect("nonempty request set").map_err(io::Error::other)?; }
-                joined = topology.join_next(), if !topology.is_empty() => {
-                    let (revision, snapshot) = joined.expect("nonempty topology set").map_err(io::Error::other)?;
-                    let Some(update) = snapshot? else { continue };
-                    paused.extend(update.affected.iter().cloned());
-                    if revision == generation {
-                        for name in &paused {
-                            if let Some(port) = seats.get(name) { port.commit_policy().await.map_err(|error| io::Error::other(format!("topology commit: {error:?}")))?; }
-                        }
-                        prepared = update.snapshot;
-                        policies = update.policies;
-                        paused.clear();
-                        prepared_generation = revision;
-                        add_seats(&prepared, &mut daemon, &mut seats, &resources, &budget, &policies, vt.as_ref())?;
-                    }
-                }
-                _ = retry.tick() => {
-                    if prepared_generation == generation { add_seats(&prepared, &mut daemon, &mut seats, &resources, &budget, &policies, vt.as_ref())?; }
-                    let current: Vec<_> = seats.values().map(|port| port.status.borrow().clone()).collect();
-                    if current != inventory {
-                        inventory = current;
-                        revision = revision.checked_add(1).ok_or_else(|| io::Error::other("inventory revision exhaustion"))?;
-                        replies.state_changed(revision);
-                    }
-                }
-                _ = audit.tick(), if topology.is_empty() && desired.is_none() => {
-                    let snapshot = if let Some(context) = &context { filtered(Snapshot::from_context(context, &[])?, config.non_vt_only, config.graphical_vt)? } else { prepared.clone() };
-                    generation = generation.checked_add(1).ok_or_else(|| io::Error::other("topology generation exhaustion"))?;
-                    desired = Some((generation, snapshot));
-                }
-                result = &mut started, if !startup_observed => {
-                    result.map_err(|_| io::Error::other("bus startup failed"))?;
-                    startup_observed = true;
-                    tracing::info!("context manager is ready");
-                }
-                // Fair selection between fresh calls and topology facts. Other
-                // control/cleanup branches above cannot be starved by clients.
-                event = async {
-                    tokio::select! {
-                        request = incoming.recv() => Input::Request(request),
-                        ready = monitor_ready(watched.as_ref()) => Input::Topology(ready),
-                    }
-                } => match event {
-                    Input::Request(Some(request)) => {
-                        if requests.len() == 64 { let _ = replies.send(error_reply(&request.message, ErrorKind::LimitExceeded, "request wait limit reached")); }
-                        else { requests.spawn(manager::dispatch(request, daemon.registry_mut(), &seats, replies.clone())); }
-                    }
-                    Input::Request(None) => break Err(io::Error::other("D-Bus request pump stopped")),
-                    Input::Topology(result) => {
-                        let mut ready = result?;
-                        let context = context.as_mut().expect("monitor context");
-                        let mut count = 0;
-                        while count < 64 && context.receive().map_err(io::Error::other)?.is_some() { count += 1; }
-                        if count < 64 { ready.clear_ready(); } else { ready.retain_ready(); }
-                        let snapshot = filtered(Snapshot::from_context(context, &[])?, config.non_vt_only, config.graphical_vt)?;
-                        for name in seats.keys().filter(|name| !snapshot.seats.contains(*name)) {
-                            daemon.registry_mut().withdraw_seat(name);
-                            retiring.insert(name.clone());
-                        }
-                        generation = generation.checked_add(1).ok_or_else(|| io::Error::other("topology generation exhaustion"))?;
-                        desired = Some((generation, snapshot));
-                    }
-                }
-            }
-        }
-    }.await;
-    daemon.quiesce();
-    resources.fence();
-    let mut shutdown_failed = false;
-    // Drain pending publications, including registration replies already queued
-    // in controllers. Guards cannot resurrect any now-invalidated context.
-    while let Some(joined) = requests.join_next().await {
-        if let Err(error) = joined {
-            shutdown_failed = true;
-            tracing::error!(%error, "request task failed during shutdown");
-        }
-    }
-    // A topology worker must settle before global cleanup takes its snapshot.
-    while let Some(joined) = topology.join_next().await {
-        match joined {
-            Ok((_, Ok(_))) => {}
-            Ok((_, Err(error))) => {
-                shutdown_failed = true;
-                tracing::error!(%error, "topology preparation failed during shutdown");
-            }
-            Err(error) => {
-                shutdown_failed = true;
-                tracing::error!(%error, "topology task failed during shutdown");
+                watchdog.finish();
+                return Ok(());
             }
         }
     }
-    daemon
-        .advance(ShutdownPhase::Revoke)
-        .map_err(io::Error::other)?;
-    let cleanup_resources = resources.clone();
-    let cleanup_errors = tokio::task::spawn_blocking(move || cleanup_resources.cleanup())
-        .await
-        .map_err(io::Error::other)?;
-    if cleanup_errors.is_empty() {
-        // The outer resource owner can acknowledge teardown even if a critical
-        // seat owner failed: all indexed originals/inodes and started mutations
-        // have now settled under their actual resource locks.
-        let ids: Vec<_> = daemon.registry().removals().map(|(id, _)| id).collect();
-        for id in ids {
-            daemon.registry_mut().complete_removal(id);
-        }
-        while let Some(joined) = removals.join_next().await {
-            if let Err(error) = joined {
-                shutdown_failed = true;
-                tracing::error!(%error, "removal task panicked during shutdown");
-            }
-        }
-        daemon
-            .advance(ShutdownPhase::RestoreTerminal)
-            .map_err(io::Error::other)?;
-    } else {
-        for error in cleanup_errors {
-            tracing::error!(%error, "resource cleanup incomplete");
-        }
-        return Err(io::Error::other("resource cleanup incomplete"));
-    }
-    let exits = daemon.drain().await.map_err(io::Error::other)?;
-    let failed = exits.iter().any(|exit| exit.failure.is_some());
-    if let Some(owner) = &mut vt_owner {
-        owner.finish()?;
-    }
-    daemon
-        .advance(ShutdownPhase::Stopped)
-        .map_err(io::Error::other)?;
-    drop(replies);
-    result?;
-    if failed || shutdown_failed {
-        return Err(io::Error::other("critical service failed during shutdown"));
-    }
-    Ok(())
+    drain_and_cleanup(
+        &seat,
+        &fatal,
+        &mut discovery,
+        &mut broker_driver,
+        &mut bus_driver,
+        stop_bus,
+        &resources,
+        &mut controls,
+        &mut broker_work,
+        &mut startup,
+        &mut udev_work,
+        #[cfg(feature = "vt")]
+        &mut vt_work,
+        #[cfg(feature = "vt")]
+        &mut terminal,
+        #[cfg(feature = "vt")]
+        &vt_control,
+        &mut broker_done,
+    )
+    .await?;
+    // Keep the independent exit watchdog armed through fatal diagnostics/exit.
+    Err(io::Error::other(
+        fatal
+            .reason()
+            .unwrap_or_else(|| "seat stopped during startup".into()),
+    ))
 }
-
-enum Input<'a> {
-    Request(Option<crate::dbus::reactor::Request>),
-    Topology(io::Result<AsyncFdReadyGuard<'a, OwnedFd>>),
-}
-
-async fn monitor_ready(
-    watched: Option<&AsyncFd<OwnedFd>>,
-) -> io::Result<AsyncFdReadyGuard<'_, OwnedFd>> {
-    match watched {
-        Some(watched) => watched.readable().await,
-        None => std::future::pending().await,
-    }
-}
-
-fn filtered(
-    mut snapshot: Snapshot,
-    non_vt_only: bool,
-    graphical_vt: Option<u32>,
-) -> io::Result<Snapshot> {
-    if snapshot.seats.contains(&SeatName::seat0()) {
-        if !non_vt_only && graphical_vt.is_none() {
-            return Err(io::Error::other(
-                "seat0 requires an explicitly configured graphical VT; use --non-vt-only only to leave seat0 unmanaged",
-            ));
-        }
-        if non_vt_only {
-            snapshot.seats.remove(&SeatName::seat0());
-            snapshot.direct.remove(&SeatName::seat0());
-            snapshot.brokered.remove(&SeatName::seat0());
-        }
-    }
-    Ok(snapshot)
-}
-
-fn add_seats(
-    snapshot: &Snapshot,
-    daemon: &mut Daemon,
-    seats: &mut BTreeMap<SeatName, Port>,
-    resources: &Arc<Resources>,
-    budget: &Budget,
-    policies: &BTreeMap<SeatName, Policy>,
-    vt: Option<&crate::vt::Port>,
-) -> io::Result<()> {
-    for name in &snapshot.seats {
-        if seats.contains_key(name) {
-            continue;
-        }
-        match daemon.registry_mut().add_seat(name.clone()) {
-            Ok(()) => {}
-            Err(crate::registry::RegistryError::CleanupPending) => continue,
-            Err(error) => return Err(io::Error::other(error)),
-        }
-        let (mut controller, port) =
-            Controller::new(name.clone(), resources.clone(), budget.clone());
-        controller.set_initial_policy(policies.get(name).cloned().unwrap_or_default());
-        if name == &SeatName::seat0()
-            && let Some(port) = vt
-        {
-            controller.attach_vt(port.clone());
-        }
-        daemon
-            .spawn(
-                CriticalRole::Seat(name.clone()),
-                controller.run(daemon.subscribe()),
-            )
-            .map_err(io::Error::other)?;
-        seats.insert(name.clone(), port);
-    }
-    Ok(())
-}
-
-type Removal = (ContextId, Result<(), ErrorKind>);
-fn queue_removals(
-    daemon: &mut Daemon,
-    seats: &BTreeMap<SeatName, Port>,
-    removing: &mut BTreeSet<ContextId>,
-    retry: &mut BTreeMap<ContextId, Instant>,
-    jobs: &mut JoinSet<Removal>,
+async fn abort_startup(
+    discovery: &mut discovery::Owner,
+    #[cfg(feature = "vt")] terminal: Option<&mut linux_vt::Owner>,
 ) {
-    for (id, name) in daemon.registry().removals() {
-        if jobs.len() == 64 {
+    // No broker driver/admission has ever run here. Native restoration cannot
+    // precede an outstanding device barrier because none has been admitted.
+    let _ = discovery.control().stop();
+    #[cfg(feature = "vt")]
+    if let Some(owner) = terminal {
+        let _ = tokio::time::timeout(fatal::FLUSH_LIMIT, owner.control().shutdown()).await;
+        let end = Instant::now() + fatal::FLUSH_LIMIT;
+        while Instant::now() < end {
+            match owner.join_if_finished() {
+                Ok(true) | Err(_) => break,
+                Ok(false) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    }
+    let end = Instant::now() + fatal::FLUSH_LIMIT;
+    while Instant::now() < end {
+        match discovery.join_if_finished() {
+            Ok(true) | Err(_) => break,
+            Ok(false) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+}
+fn source_result(
+    result: std::result::Result<fatal::Result<()>, Box<dyn std::any::Any + Send>>,
+) -> String {
+    match result {
+        Ok(Ok(())) => "unexpected adapter exit".into(),
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => "adapter panicked; admitted operations retained".into(),
+    }
+}
+#[allow(clippy::too_many_arguments)]
+async fn drain_and_cleanup<'a>(
+    seat: &'a Seat,
+    fatal: &Fatal,
+    discovery: &mut discovery::Owner,
+    broker_driver: &mut Driver,
+    bus_driver: &mut Driver,
+    stop_bus: watch::Sender<bool>,
+    resources: &Arc<Resources>,
+    controls: &mut ControlWork<'a>,
+    broker_work: &mut BrokerWork<'a>,
+    startup: &mut SequentialWork<'a>,
+    udev: &mut SequentialWork<'a>,
+    #[cfg(feature = "vt")] vt: &mut SequentialWork<'a>,
+    #[cfg(feature = "vt")] terminal: &mut linux_vt::Owner,
+    #[cfg(feature = "vt")] vt_control: &linux_vt::Control,
+    broker_done: &mut bool,
+) -> io::Result<()> {
+    fatal.stop();
+    // FIRST keep polling requests and the actual bus flush pump. Neither State
+    // nor an unresponsive worker is needed to send the explicit fatal response.
+    let reply_barrier = Instant::now() + Duration::from_millis(750);
+    loop {
+        select_sources! {[
+            _ = sleep_until(reply_barrier) => break,
+            _ = controls.next(), if !controls.is_empty() => {},
+            _ = broker_work.next(), if !broker_work.is_empty() => {},
+            _ = sequential(startup), if startup.is_some() => {},
+            _ = sequential(udev), if udev.is_some() => {},
+            result = drive(broker_driver), if broker_driver.is_some() => { *broker_done = result.is_ok(); if let Err(error) = result { failed(fatal, "broker during reply barrier", error); } },
+            result = drive(bus_driver), if bus_driver.is_some() => if let Err(error) = result { failed(fatal, "bus during reply barrier", error); },
+        ] [_ = sequential(vt), if vt.is_some() => {},]}
+    }
+    // Only now begin all-context/resource/terminal cleanup. Started workers and
+    // their guard/pins remain owned while this independent bound is polled.
+    let end = Instant::now() + fatal::CLEANUP_LIMIT;
+    let cleanup = seat.cleanup();
+    tokio::pin!(cleanup);
+    let mut acl_done = false;
+    #[cfg(feature = "vt")]
+    let mut acl_clean = false;
+    let mut cleanup_errors = Vec::new();
+    let mut fallback: Option<tokio::task::JoinHandle<Vec<io::Error>>> = None;
+    let mut fallback_done = false;
+    let mut discovery_done = false;
+    if let Err(error) = discovery.control().stop() {
+        cleanup_errors.push(error.to_string());
+    }
+    #[cfg(feature = "vt")]
+    let mut native_shutdown: Option<LocalBoxFuture<'_, io::Result<()>>> = None;
+    #[cfg(feature = "vt")]
+    let mut terminal_done = false;
+    loop {
+        if broker_driver.is_none() && !*broker_done && !fallback_done && fallback.is_none() {
+            let resources = resources.clone();
+            fallback = Some(tokio::task::spawn_blocking(move || resources.cleanup()));
+        }
+        if !discovery_done {
+            match discovery.join_if_finished() {
+                Ok(done) => discovery_done = done,
+                Err(error) => {
+                    discovery_done = true;
+                    cleanup_errors.push(error.to_string());
+                }
+            }
+        }
+        #[cfg(feature = "vt")]
+        if acl_clean
+            && broker_driver.is_none()
+            && (*broker_done || fallback_done)
+            && resources.pending() == 0
+            && native_shutdown.is_none()
+            && !terminal_done
+        {
+            native_shutdown = Some(vt_control.shutdown().boxed_local());
+        }
+        #[cfg(feature = "vt")]
+        if terminal_done {
+            match terminal.join_if_finished() {
+                Ok(_) => {}
+                Err(error) => cleanup_errors.push(error.to_string()),
+            }
+        }
+        #[cfg(not(feature = "vt"))]
+        let terminal_joined = true;
+        #[cfg(feature = "vt")]
+        let terminal_joined = terminal_done && terminal.join_if_finished().unwrap_or(false);
+        if acl_done
+            && discovery_done
+            && broker_driver.is_none()
+            && resources.pending() == 0
+            && terminal_joined
+            && controls.is_empty()
+            && broker_work.is_empty()
+            && startup.is_none()
+            && udev.is_none()
+            && {
+                #[cfg(feature = "vt")]
+                {
+                    vt.is_none()
+                }
+                #[cfg(not(feature = "vt"))]
+                {
+                    true
+                }
+            }
+        {
             break;
         }
-        if removing.contains(&id)
-            || retry
-                .get(&id)
-                .is_some_and(|deadline| *deadline > Instant::now())
-        {
-            continue;
-        }
-        if let Some(port) = seats.get(name) {
-            let (sender, receiver) = oneshot::channel();
-            if port
-                .send(Command::Remove {
-                    context: id,
-                    reply: sender,
-                })
-                .is_ok()
-            {
-                removing.insert(id);
-                jobs.spawn(async move {
-                    (
-                        id,
-                        timeout(Duration::from_secs(10), receiver)
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
-                            .unwrap_or(Err(ErrorKind::CleanupPending)),
-                    )
-                });
+        select_sources! {[
+            _ = sleep_until(end) => { cleanup_errors.push(format!("cleanup bound expired: {} retained broker originals; ACL/operations/native owners may remain unsettled", resources.pending())); break; },
+            result = &mut cleanup, if !acl_done => {
+                let (settled,errors)=result;
+                acl_done = true;
+                #[cfg(feature = "vt")]
+                { acl_clean = settled; }
+                #[cfg(not(feature = "vt"))]
+                let _ = settled;
+                cleanup_errors.extend(errors.into_iter().map(|error| error.to_string()));
+            },
+            result = drive(broker_driver), if broker_driver.is_some() => { *broker_done = result.is_ok(); if let Err(error) = result { cleanup_errors.push(error.to_string()); } },
+            result = drive(bus_driver), if bus_driver.is_some() => if let Err(error) = result { cleanup_errors.push(error.to_string()); },
+            result = async { fallback.as_mut().expect("retained cleanup worker").await }, if fallback.is_some() => {
+                fallback_done = true; fallback.take();
+                match result { Ok(errors) => cleanup_errors.extend(errors.into_iter().map(|error| error.to_string())), Err(error) => cleanup_errors.push(error.to_string()) }
             }
+            _ = controls.next(), if !controls.is_empty() => {},
+            _ = broker_work.next(), if !broker_work.is_empty() => {},
+            _ = sequential(startup), if startup.is_some() => {},
+            _ = sequential(udev), if udev.is_some() => {},
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+        ] [
+            result = async { native_shutdown.as_mut().expect("retained native restoration").await }, if native_shutdown.is_some() => {
+                native_shutdown.take(); terminal_done = true; if let Err(error) = result { cleanup_errors.push(error.to_string()); }
+            },
+            _ = sequential(vt), if vt.is_some() => {},
+        ]}
+    }
+    stop_bus.send_replace(true);
+    if bus_driver.is_some() {
+        match tokio::time::timeout(fatal::FLUSH_LIMIT, drive(bus_driver)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => cleanup_errors.push(error.to_string()),
+            Err(_) => cleanup_errors.push("bus owner did not join".into()),
         }
+    }
+    if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        failed(fatal, "bounded cleanup", cleanup_errors.join("; "));
+        Err(io::Error::other(cleanup_errors.join("; ")))
     }
 }

@@ -6,7 +6,7 @@
 # remote, and LIBSEAT_COMMIT pins the revision. Network failures return 77 so
 # harnesses can skip rather than fail.
 LIBSEAT_URL=${LIBSEAT_URL:-https://github.com/shaitan-machine1/seatd.git}
-LIBSEAT_COMMIT=${LIBSEAT_COMMIT:-7813c08e35cbff69069dbdecda97f7c7ff506cc2}
+LIBSEAT_COMMIT=${LIBSEAT_COMMIT:-42fe3abfdcaefd2d5cbd21f9db803b9da6a2ca6c}
 
 resolve_libseat_source() {
     if [ -n "${LIBSEAT_REPO:-}" ]; then

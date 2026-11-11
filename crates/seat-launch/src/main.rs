@@ -4,7 +4,6 @@ use std::ffi::OsString;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -12,6 +11,12 @@ use std::time::Duration;
     about = "Exec a seat client with one fresh capability-authorized seatd connection"
 )]
 struct Args {
+    /// Explicit seat route (otherwise use caller-supplied XDG_SEAT).
+    #[arg(long)]
+    seat: Option<String>,
+    /// Explicit private bus integration; the root owner is still verified.
+    #[arg(long, hide = true)]
+    bus_address: Option<String>,
     /// Explicit inherited full-authority descriptor (otherwise use MULTISEATD_AUTHORITY_FD).
     #[arg(long)]
     authority_fd: Option<i32>,
@@ -38,7 +43,15 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // inherited FD, which has no other Rust owner in this process.
     let authority = unsafe { OwnedFd::from_raw_fd(raw) };
     launch::inheritable(authority.as_fd(), false)?;
-    let client = Client::system(Duration::from_secs(11))?;
+    let seat = args
+        .seat
+        .or_else(|| std::env::var("XDG_SEAT").ok())
+        .ok_or("supply --seat or XDG_SEAT")?;
+    let client = if let Some(address) = &args.bus_address {
+        Client::for_address(address, &seat, libmultiseatd::DEFAULT_TIMEOUT)?
+    } else {
+        Client::system(&seat)?
+    };
     // Standard streams may be sockets (logging), but never context keys.
     // Authorization is performed only by the daemon, not by a local verifier.
     for standard in 0..=2 {
@@ -50,7 +63,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             match client.get_context(fd) {
                 Ok(_) => return Err("authority inherited through standard IO".into()),
                 Err(error)
-                    if error.name() == Some(libmultiseatd::ErrorKind::AccessDenied.name()) => {}
+                    if error.name() == Some(libmultiseatd::ErrorKind::NotAuthorized.name()) => {}
                 Err(error) => return Err(error.into()),
             }
         }

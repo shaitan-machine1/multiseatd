@@ -1,756 +1,367 @@
 use super::*;
-use crate::daemon::CriticalTasks;
-use crate::registry::{Limits, Registry};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::timeout;
+use futures_util::FutureExt;
+use std::os::fd::AsFd;
+use std::panic::AssertUnwindSafe;
+use std::time::Duration;
 
-struct DeviceFaults {
-    fail_revoke: Arc<AtomicBool>,
-    fail_resume: Arc<AtomicBool>,
-    revocations: Arc<AtomicUsize>,
+struct Fixture {
+    seat: Seat,
+    owner: discovery::Owner,
+    driver: tokio::task::JoinHandle<io::Result<()>>,
+    workers: Arc<Semaphore>,
+    _file: tempfile::NamedTempFile,
 }
-impl crate::device::DeviceOps for DeviceFaults {
-    fn open(&mut self, _: &crate::device::AllowedDevice) -> io::Result<OwnedFd> {
-        Ok(std::fs::File::open("/dev/null")?.into())
-    }
-    fn deactivate(&mut self, _: crate::device::DeviceKind, _: &OwnedFd) -> io::Result<()> {
-        self.revocations.fetch_add(1, Ordering::AcqRel);
-        if self.fail_revoke.load(Ordering::Acquire) {
-            Err(io::Error::other("injected revoke refusal"))
-        } else {
-            Ok(())
-        }
-    }
-    fn activate(&mut self, _: crate::device::DeviceKind, _: &OwnedFd) -> io::Result<()> {
-        if self.fail_resume.load(Ordering::Acquire) {
-            Err(io::Error::other("injected resume refusal"))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-fn attach_device(
-    harness: &Harness,
-    owner: ConnectionKey,
-    primary: bool,
-    fail_revoke: Arc<AtomicBool>,
-    fail_resume: Arc<AtomicBool>,
-    revocations: Arc<AtomicUsize>,
-) -> OwnedFd {
-    use std::os::unix::fs::MetadataExt;
-    let device = crate::device::AllowedDevice::canonicalized(
-        crate::device::DeviceId::new("fixture"),
-        "/dev/null",
-        std::fs::metadata("/dev/null").unwrap().rdev(),
-        if primary {
-            crate::device::DeviceKind::DrmPrimary
-        } else {
-            crate::device::DeviceKind::Evdev
-        },
-    )
-    .unwrap();
-    let id = harness
-        .resources
-        .reserve_with(
-            owner,
-            device,
-            Box::new(DeviceFaults {
-                fail_revoke,
-                fail_resume,
-                revocations,
+impl Fixture {
+    async fn new() -> Self {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let workers = Arc::new(Semaphore::new(1));
+        let resources = Arc::new(dev_broker::resources::Resources::new(128).unwrap());
+        let (driver, control, _events) =
+            broker::Broker::new("seat-test".into(), false, resources, workers.clone());
+        let fatal = Fatal::new(control.clone());
+        let owner = discovery::Owner::start(
+            Some(discovery::Fixture {
+                seat: SeatName::parse("seat-test").unwrap(),
+                direct_nodes: vec![file.path().into()],
+                null_device: false,
+                assignments: None,
             }),
+            fatal.clone(),
         )
         .unwrap();
-    harness.resources.open(id, &Permit::new()).unwrap()
-}
-
-struct Peer {
-    id: ConnectionId,
-    resource_owner: ConnectionKey,
-    stream: tokio::net::UnixStream,
-}
-impl Peer {
-    async fn send(&mut self, opcode: u16) {
-        self.stream.write_all(&wire::empty(opcode)).await.unwrap();
-    }
-    async fn receive(&mut self) -> io::Result<wire::Packet> {
-        timeout(Duration::from_secs(4), async {
-            let mut header = [0u8; 4];
-            self.stream.read_exact(&mut header).await?;
-            let length = u16::from_ne_bytes([header[2], header[3]]) as usize;
-            assert!(length <= 1024);
-            let mut payload = vec![0; length];
-            self.stream.read_exact(&mut payload).await?;
-            Ok(wire::Packet {
-                opcode: u16::from_ne_bytes([header[0], header[1]]),
-                payload,
-            })
-        })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "wire reply timeout"))?
-    }
-    async fn expect(&mut self, opcode: u16) {
-        assert_eq!(self.receive().await.unwrap().opcode, opcode);
-    }
-    async fn open(&mut self) {
-        self.send(wire::CLIENT_OPEN_SEAT).await;
-        self.expect(wire::SERVER_SEAT_OPENED).await;
-    }
-    async fn acknowledge(&mut self) {
-        self.send(wire::CLIENT_DISABLE_SEAT).await;
-        self.expect(wire::SERVER_SEAT_DISABLED).await;
-    }
-    async fn ping(&mut self) {
-        self.send(wire::CLIENT_PING).await;
-        self.expect(wire::SERVER_PONG).await;
-    }
-}
-
-struct Harness {
-    registry: Registry,
-    port: Port,
-    tasks: CriticalTasks,
-    authorities: Vec<OwnedFd>,
-    resources: Arc<Resources>,
-    budget: Budget,
-    _cleanup: crate::resources::CleanupGuard,
-}
-impl Harness {
-    fn new() -> Self {
-        let mut registry = Registry::new(Limits::default()).unwrap();
-        let name: SeatName = "seat-test".parse().unwrap();
-        registry.add_seat(name.clone()).unwrap();
-        let resources = Arc::new(Resources::new(64, 64).unwrap());
-        let mut tasks = CriticalTasks::new(8).unwrap();
-        let budget = Budget::default();
-        let (controller, port) = Controller::new(name.clone(), resources.clone(), budget.clone());
-        tasks
-            .spawn(
-                crate::daemon::CriticalRole::Seat(name),
-                controller.run(tasks.subscribe()),
-            )
-            .unwrap();
+        let seat = Seat::new(
+            SeatName::parse("seat-test").unwrap(),
+            control,
+            owner.control(),
+            fatal,
+            workers.clone(),
+        )
+        .unwrap();
+        let driver = tokio::spawn(driver.run());
+        seat.initialize().await.unwrap();
         Self {
-            registry,
-            port,
-            tasks,
-            authorities: Vec::new(),
-            resources: resources.clone(),
-            budget,
-            _cleanup: crate::resources::CleanupGuard(resources),
+            seat,
+            owner,
+            driver,
+            workers,
+            _file: file,
         }
     }
-    async fn context(&mut self) -> ContextId {
-        let publication = self
-            .registry
-            .begin_context(&"seat-test".parse().unwrap())
-            .unwrap();
-        let id = publication.context();
-        let (sender, receiver) = oneshot::channel();
-        self.port
-            .send(Command::Register {
-                context: id,
-                lifetime: publication.registration(),
-                reply: sender,
-            })
-            .unwrap();
-        receiver.await.unwrap().unwrap();
-        self.authorities
-            .push(publication.publish(|_, fd| Ok::<_, io::Error>(fd)).unwrap());
-        id
-    }
-    async fn publication(&self, context: ContextId) -> ConnectionPublication {
-        let (sender, receiver) = oneshot::channel();
-        self.port
-            .send(Command::CreateConnection {
-                context,
-                reply: sender,
-            })
-            .unwrap();
-        receiver.await.unwrap().unwrap()
-    }
-    async fn peer(&self, context: ContextId) -> Peer {
-        let publication = self.publication(context).await;
-        let id = publication.id();
-        let resource_owner = publication.resource_owner;
-        let fd = publication.publish(|_, fd| Ok(fd)).unwrap();
-        let stream = UnixStream::from(fd);
-        stream.set_nonblocking(true).unwrap();
-        Peer {
-            id,
-            resource_owner,
-            stream: tokio::net::UnixStream::from_std(stream).unwrap(),
-        }
-    }
-    fn mutation(
-        &self,
-        context: ContextId,
-        activate: bool,
-    ) -> oneshot::Receiver<Result<(), ErrorKind>> {
-        let (sender, receiver) = oneshot::channel();
-        self.port
-            .send(if activate {
-                Command::Activate {
-                    context,
-                    reply: sender,
-                }
-            } else {
-                Command::Deactivate {
-                    context,
-                    reply: sender,
-                }
-            })
-            .unwrap();
-        receiver
-    }
-    async fn activate(&self, context: ContextId) {
-        timeout(Duration::from_secs(4), self.mutation(context, true))
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-    async fn deactivate(&self, context: ContextId) {
-        timeout(Duration::from_secs(4), self.mutation(context, false))
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-    async fn remove(&mut self, context: ContextId) {
-        self.registry.remove(context);
-        let (sender, receiver) = oneshot::channel();
-        self.port
-            .send(Command::Remove {
-                context,
-                reply: sender,
-            })
-            .unwrap();
-        timeout(Duration::from_secs(4), receiver)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        self.registry.complete_removal(context);
-    }
-    async fn wait(&mut self, condition: impl Fn(&Status) -> bool) {
-        timeout(Duration::from_secs(4), async {
-            loop {
-                if condition(&self.port.status.borrow()) {
-                    return;
-                }
-                self.port.status.changed().await.unwrap();
+    async fn finish(mut self) {
+        self.seat.fatal.stop();
+        let (settled, errors) = self.seat.cleanup().await;
+        assert!(settled && errors.is_empty());
+        self.driver.await.unwrap().unwrap();
+        self.owner.control().stop().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !self.owner.join_if_finished().unwrap() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
         .unwrap();
     }
-    async fn finish(mut self) {
-        self.registry.close_admission();
-        self.tasks.quiesce();
-        self.tasks.advance(ShutdownPhase::Revoke).unwrap();
-        assert!(self.resources.cleanup().is_empty());
-        self.tasks.advance(ShutdownPhase::RestoreTerminal).unwrap();
-        let exits = timeout(Duration::from_secs(4), self.tasks.drain())
+}
+#[tokio::test]
+async fn occupied_activation_rejects_before_effects_and_never_replaces() {
+    let h = Fixture::new().await;
+    let (a, first) = h.seat.create_context(0, Budget::new()).await.unwrap();
+    let (_b, second) = h.seat.create_context(0, Budget::new()).await.unwrap();
+    h.seat
+        .set_grant(a.as_fd(), 424242, true, Budget::new())
+        .await
+        .unwrap();
+    h.seat.activate_context(first, Budget::new()).await.unwrap();
+    for id in [first, second] {
+        assert_eq!(
+            h.seat
+                .activate_context(id, Budget::new())
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Busy
+        );
+    }
+    let rows = h.seat.list_contexts(Budget::new()).await.unwrap();
+    assert!(rows.iter().find(|row| row.id == first).unwrap().effective);
+    assert!(!rows.iter().find(|row| row.id == second).unwrap().active);
+    h.seat
+        .deactivate_context(first, Budget::new())
+        .await
+        .unwrap();
+    h.seat
+        .activate_context(second, Budget::new())
+        .await
+        .unwrap();
+    assert!(
+        !h.seat
+            .get_context(a.as_fd(), Budget::new())
             .await
             .unwrap()
-            .unwrap();
-        assert!(exits.iter().all(|exit| exit.failure.is_none()), "{exits:?}");
-        self.tasks.advance(ShutdownPhase::Stopped).unwrap();
-    }
-}
-
-#[tokio::test]
-async fn inactive_membership_and_parallel_transports_never_select_a_context() {
-    let mut harness = Harness::new();
-    let context = harness.context().await;
-    let mut first = harness.peer(context).await;
-    let mut second = harness.peer(context).await;
-    first.open().await;
-    second.open().await;
-    first.ping().await;
-    second.ping().await;
-    assert!(harness.port.status.borrow().seat.3.is_empty());
-    assert!(harness.port.status.borrow().seat.4.is_empty());
-    assert!(
-        timeout(Duration::from_millis(30), first.receive())
-            .await
-            .is_err()
+            .active
     );
-    harness.activate(context).await;
-    first.expect(wire::SERVER_ENABLE_SEAT).await;
-    second.expect(wire::SERVER_ENABLE_SEAT).await;
-    first.ping().await;
-    second.ping().await;
-    harness.finish().await;
+    h.finish().await;
 }
-
 #[tokio::test]
-async fn handover_waits_for_each_ack_and_preserves_healthy_siblings() {
-    let mut harness = Harness::new();
-    let a = harness.context().await;
-    let b = harness.context().await;
-    let mut first = harness.peer(a).await;
-    let mut sibling = harness.peer(a).await;
-    let mut target = harness.peer(b).await;
-    first.open().await;
-    sibling.open().await;
-    target.open().await;
-    harness.activate(a).await;
-    first.expect(wire::SERVER_ENABLE_SEAT).await;
-    sibling.expect(wire::SERVER_ENABLE_SEAT).await;
-    let mut activating = harness.mutation(b, true);
-    first.expect(wire::SERVER_DISABLE_SEAT).await;
-    sibling.expect(wire::SERVER_DISABLE_SEAT).await;
-    first.acknowledge().await;
-    assert!(activating.try_recv().is_err());
-    assert!(
-        timeout(Duration::from_millis(30), target.receive())
-            .await
-            .is_err()
-    );
-    sibling.acknowledge().await;
-    activating.await.unwrap().unwrap();
-    target.expect(wire::SERVER_ENABLE_SEAT).await;
-    first.ping().await;
-    sibling.ping().await;
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn deactivating_an_unselected_inactive_context_does_not_disturb_another() {
-    let mut harness = Harness::new();
-    let a = harness.context().await;
-    let b = harness.context().await;
-    let mut peer = harness.peer(b).await;
-    peer.open().await;
-    harness.activate(b).await;
-    peer.expect(wire::SERVER_ENABLE_SEAT).await;
-    harness.deactivate(a).await;
-    peer.ping().await;
-    assert_eq!(harness.port.status.borrow().seat.4, b.to_string());
-    harness.remove(a).await;
-    peer.ping().await;
-    assert_eq!(harness.port.status.borrow().seat.4, b.to_string());
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn one_eof_leaves_context_and_other_enabled_connections_alive() {
-    let mut harness = Harness::new();
-    let context = harness.context().await;
-    let mut first = harness.peer(context).await;
-    let mut sibling = harness.peer(context).await;
-    first.open().await;
-    sibling.open().await;
-    harness.activate(context).await;
-    first.expect(wire::SERVER_ENABLE_SEAT).await;
-    sibling.expect(wire::SERVER_ENABLE_SEAT).await;
-    let first_id = first.id;
-    drop(first);
-    harness
-        .wait(|status| !status.connections.contains_key(&first_id))
-        .await;
-    sibling.ping().await;
-    assert_eq!(harness.port.status.borrow().contexts[&context].2, "active");
-    let mut replacement = harness.peer(context).await;
-    replacement.open().await;
-    replacement.expect(wire::SERVER_ENABLE_SEAT).await;
-    assert_ne!(replacement.id, first_id);
-    sibling.ping().await;
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn close_and_reopen_membership_uses_the_same_transport_without_selection_changes() {
-    let mut harness = Harness::new();
-    let context = harness.context().await;
-    harness.activate(context).await;
-    let mut peer = harness.peer(context).await;
-    peer.open().await;
-    peer.expect(wire::SERVER_ENABLE_SEAT).await;
-    peer.send(wire::CLIENT_CLOSE_SEAT).await;
-    peer.expect(wire::SERVER_SEAT_CLOSED).await;
-    peer.ping().await;
-    peer.open().await;
-    peer.expect(wire::SERVER_ENABLE_SEAT).await;
-    assert_eq!(harness.port.status.borrow().seat.4, context.to_string());
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn unpublished_connections_are_closed_without_removing_the_context() {
-    let mut harness = Harness::new();
-    let context = harness.context().await;
-    let publication = harness.publication(context).await;
-    let id = publication.id();
-    drop(publication);
-    harness
-        .wait(|status| !status.connections.contains_key(&id))
-        .await;
-    assert!(harness.port.status.borrow().contexts.contains_key(&context));
-    let mut peer = harness.peer(context).await;
-    peer.ping().await;
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn removal_fences_a_pending_connection_publication_and_never_falls_back() {
-    let mut harness = Harness::new();
-    let context = harness.context().await;
-    harness.activate(context).await;
-    let publication = harness.publication(context).await;
-    harness.remove(context).await;
-    assert!(
-        publication
-            .publish::<()>(|_, _| panic!("removed context must not publish"))
-            .is_err()
-    );
-    assert!(harness.port.status.borrow().seat.3.is_empty());
-    assert!(harness.port.status.borrow().seat.4.is_empty());
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn missing_disable_ack_disconnects_only_the_misser_and_requires_a_fresh_transport() {
-    let mut harness = Harness::new();
-    let a = harness.context().await;
-    let b = harness.context().await;
-    let mut healthy = harness.peer(a).await;
-    let mut missed = harness.peer(a).await;
-    healthy.open().await;
-    missed.open().await;
-    harness.activate(a).await;
-    healthy.expect(wire::SERVER_ENABLE_SEAT).await;
-    missed.expect(wire::SERVER_ENABLE_SEAT).await;
-    let activating = harness.mutation(b, true);
-    healthy.expect(wire::SERVER_DISABLE_SEAT).await;
-    missed.expect(wire::SERVER_DISABLE_SEAT).await;
-    healthy.acknowledge().await;
-    timeout(Duration::from_secs(4), activating)
+async fn inactive_grants_do_not_union_with_the_current_acl_target() {
+    let h = Fixture::new().await;
+    let (a, first) = h.seat.create_context(0, Budget::new()).await.unwrap();
+    let (b, _second) = h.seat.create_context(0, Budget::new()).await.unwrap();
+    h.seat
+        .set_grant(a.as_fd(), 424242, true, Budget::new())
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
-    assert!(missed.receive().await.is_err());
-    healthy.ping().await;
-    let old_id = missed.id;
-    let mut fresh = harness.peer(a).await;
-    fresh.open().await;
-    harness.activate(a).await;
-    healthy.expect(wire::SERVER_ENABLE_SEAT).await;
-    fresh.expect(wire::SERVER_ENABLE_SEAT).await;
-    assert_ne!(fresh.id, old_id);
-    let mut disabling = harness.mutation(a, false);
-    healthy.expect(wire::SERVER_DISABLE_SEAT).await;
-    fresh.expect(wire::SERVER_DISABLE_SEAT).await;
-    let _ = missed
-        .stream
-        .write_all(&wire::empty(wire::CLIENT_DISABLE_SEAT))
-        .await;
-    assert!(disabling.try_recv().is_err());
-    healthy.acknowledge().await;
-    fresh.acknowledge().await;
-    disabling.await.unwrap().unwrap();
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn cancellation_of_the_wait_does_not_cancel_an_admitted_activation() {
-    let mut harness = Harness::new();
-    let context = harness.context().await;
-    drop(harness.mutation(context, true));
-    harness.wait(|status| status.contexts[&context].6).await;
-    assert_eq!(harness.port.status.borrow().seat.4, context.to_string());
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn connection_removal_rejects_foreign_membership_and_does_not_revoke_siblings() {
-    let mut harness = Harness::new();
-    let a = harness.context().await;
-    let b = harness.context().await;
-    let mut peer = harness.peer(a).await;
-    let mut sibling = harness.peer(a).await;
-    peer.open().await;
-    sibling.open().await;
-    harness.activate(a).await;
-    peer.expect(wire::SERVER_ENABLE_SEAT).await;
-    sibling.expect(wire::SERVER_ENABLE_SEAT).await;
-    let (sender, receiver) = oneshot::channel();
-    harness
-        .port
-        .send(Command::RemoveConnection {
-            context: b,
-            connection: peer.id,
-            reply: sender,
-        })
-        .unwrap();
-    assert_eq!(receiver.await.unwrap(), Err(ErrorKind::UnknownConnection));
-    peer.ping().await;
-    let (sender, receiver) = oneshot::channel();
-    harness
-        .port
-        .send(Command::RemoveConnection {
-            context: a,
-            connection: peer.id,
-            reply: sender,
-        })
-        .unwrap();
-    receiver.await.unwrap().unwrap();
-    assert!(peer.receive().await.is_err());
-    sibling.ping().await;
-    assert_eq!(harness.port.status.borrow().seat.4, a.to_string());
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn failed_revocation_keeps_successor_disabled_until_autonomous_retry_succeeds() {
-    let mut harness = Harness::new();
-    let a = harness.context().await;
-    let b = harness.context().await;
-    let mut predecessor = harness.peer(a).await;
-    let mut successor = harness.peer(b).await;
-    predecessor.open().await;
-    successor.open().await;
-    harness.activate(a).await;
-    predecessor.expect(wire::SERVER_ENABLE_SEAT).await;
-    let fail = Arc::new(AtomicBool::new(true));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let _client_fd = attach_device(
-        &harness,
-        predecessor.resource_owner,
-        false,
-        fail.clone(),
-        Arc::new(AtomicBool::new(false)),
-        calls.clone(),
-    );
-    let mut activating = harness.mutation(b, true);
-    predecessor.expect(wire::SERVER_DISABLE_SEAT).await;
-    predecessor.acknowledge().await;
-    harness
-        .wait(|status| !status.contexts[&a].7.is_empty())
-        .await;
-    assert!(activating.try_recv().is_err());
-    assert!(
-        timeout(Duration::from_millis(30), successor.receive())
-            .await
-            .is_err()
-    );
-    fail.store(false, Ordering::Release);
-    timeout(Duration::from_secs(4), activating)
+    h.seat.activate_context(first, Budget::new()).await.unwrap();
+    h.seat
+        .set_grant(b.as_fd(), 424243, true, Budget::new())
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
-    successor.expect(wire::SERVER_ENABLE_SEAT).await;
-    assert!(calls.load(Ordering::Acquire) >= 2);
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn failed_primary_resume_rolls_back_instead_of_leaving_partial_activation() {
-    let mut harness = Harness::new();
-    let a = harness.context().await;
-    let b = harness.context().await;
-    let mut peer = harness.peer(b).await;
-    peer.open().await;
-    harness.activate(b).await;
-    peer.expect(wire::SERVER_ENABLE_SEAT).await;
-    let fail_resume = Arc::new(AtomicBool::new(false));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let _client_fd = attach_device(
-        &harness,
-        peer.resource_owner,
-        true,
-        Arc::new(AtomicBool::new(false)),
-        fail_resume.clone(),
-        calls.clone(),
-    );
-    let deactivating = harness.mutation(b, false);
-    peer.expect(wire::SERVER_DISABLE_SEAT).await;
-    peer.acknowledge().await;
-    deactivating.await.unwrap().unwrap();
-    harness.activate(a).await;
-    fail_resume.store(true, Ordering::Release);
-    let result = timeout(Duration::from_secs(4), harness.mutation(b, true))
+    h.seat
+        .set_grant(b.as_fd(), 424242, true, Budget::new())
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(result, Err(ErrorKind::BackendFailure));
-    assert!(harness.port.status.borrow().seat.3.is_empty());
-    assert!(harness.port.status.borrow().seat.4.is_empty());
-    assert!(calls.load(Ordering::Acquire) >= 2);
-    assert!(
-        timeout(Duration::from_millis(30), peer.receive())
-            .await
-            .is_err()
+    h.seat
+        .set_grant(b.as_fd(), 424242, false, Budget::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        h.seat.state.read().await.acl.desired_users(),
+        &BTreeSet::from([424242])
     );
-    peer.ping().await;
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn removal_of_the_selected_target_during_handover_cannot_resurrect_it() {
-    let mut harness = Harness::new();
-    let a = harness.context().await;
-    let b = harness.context().await;
-    let mut predecessor = harness.peer(a).await;
-    let mut target = harness.peer(b).await;
-    predecessor.open().await;
-    target.open().await;
-    harness.activate(a).await;
-    predecessor.expect(wire::SERVER_ENABLE_SEAT).await;
-    let activating = harness.mutation(b, true);
-    predecessor.expect(wire::SERVER_DISABLE_SEAT).await;
-    harness.remove(b).await;
-    assert!(target.receive().await.is_err());
-    predecessor.acknowledge().await;
-    assert_eq!(activating.await.unwrap(), Err(ErrorKind::ContextRemoving));
-    assert!(harness.port.status.borrow().seat.3.is_empty());
-    assert!(harness.port.status.borrow().seat.4.is_empty());
-    predecessor.ping().await;
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn identical_pending_requests_coalesce_but_not_across_an_intervening_deactivation() {
-    let mut harness = Harness::new();
-    let a = harness.context().await;
-    let b = harness.context().await;
-    let mut predecessor = harness.peer(a).await;
-    let mut target = harness.peer(b).await;
-    predecessor.open().await;
-    target.open().await;
-    harness.activate(a).await;
-    predecessor.expect(wire::SERVER_ENABLE_SEAT).await;
-    let first = harness.mutation(b, true);
-    predecessor.expect(wire::SERVER_DISABLE_SEAT).await;
-    let identical = harness.mutation(b, true);
-    let deactivation = harness.mutation(b, false);
-    let mut later = harness.mutation(b, true);
-    predecessor.acknowledge().await;
-    first.await.unwrap().unwrap();
-    identical.await.unwrap().unwrap();
-    target.expect(wire::SERVER_ENABLE_SEAT).await;
-    target.expect(wire::SERVER_DISABLE_SEAT).await;
-    assert!(later.try_recv().is_err());
-    target.acknowledge().await;
-    deactivation.await.unwrap().unwrap();
-    later.await.unwrap().unwrap();
-    target.expect(wire::SERVER_ENABLE_SEAT).await;
-    harness.finish().await;
-}
-
-async fn late_join_delivery_case(fail_delivery: bool) {
-    // Drive the owner directly so transports cannot run between the initial
-    // enable batch and the late OPEN_SEAT. No scheduler timing assumptions.
-    let name: SeatName = "seat-test".parse().unwrap();
-    let mut registry = Registry::new(Limits::default()).unwrap();
-    registry.add_seat(name.clone()).unwrap();
-    let publication = registry.begin_context(&name).unwrap();
-    let context = publication.context();
-    let resources = Arc::new(Resources::new(64, 64).unwrap());
-    let (mut controller, _port) = Controller::new(name, resources, Budget::default());
-    let (reply, receiver) = oneshot::channel();
-    controller
-        .command(
-            Command::Register {
-                context,
-                lifetime: publication.registration(),
-                reply,
-            },
-            false,
-        )
-        .unwrap();
-    receiver.await.unwrap().unwrap();
-    let _authority = publication.publish(|_, fd| Ok::<_, io::Error>(fd)).unwrap();
-    let first = controller.create_connection(context).unwrap();
-    let first_id = first.id();
-    let _first_fd = first.publish(|_, fd| Ok(fd)).unwrap();
-    let (done, _) = oneshot::channel();
-    controller
-        .packet(connection::Request {
-            connection: first_id,
-            packet: wire::Packet {
-                opcode: wire::CLIENT_OPEN_SEAT,
-                payload: Vec::new(),
-            },
-            done,
-        })
-        .unwrap();
-    let (reply, mut activation) = oneshot::channel();
-    controller.mutate(context, true, reply, false);
-    controller.drive().unwrap();
-    let completion = controller.jobs.join_next().await.unwrap().unwrap();
-    controller.complete(completion);
-    controller.drive().unwrap();
-    assert!(controller.transition.as_ref().unwrap().enabling);
-    let late = controller.create_connection(context).unwrap();
-    let late_id = late.id();
-    let _late_fd = late.publish(|_, fd| Ok(fd)).unwrap();
-    if fail_delivery {
-        for _ in 0..31 {
-            assert!(controller.send(late_id, wire::empty(wire::SERVER_PONG), None));
-        }
-    }
-    let (done, _) = oneshot::channel();
-    controller
-        .packet(connection::Request {
-            connection: late_id,
-            packet: wire::Packet {
-                opcode: wire::CLIENT_OPEN_SEAT,
-                payload: Vec::new(),
-            },
-            done,
-        })
-        .unwrap();
-    let transition = controller.transition.as_mut().unwrap();
-    assert!(transition.pending_enable.contains(&late_id));
-    transition.pending_enable.remove(&first_id);
-    if fail_delivery {
-        assert_eq!(transition.failure, Some(ErrorKind::BackendFailure));
-        controller.drive().unwrap();
-        assert!(controller.selected.is_none());
-        assert!(controller.effective.is_none());
-        assert!(
-            !controller.contexts[&context]
-                .epoch
-                .as_ref()
-                .unwrap()
-                .is_open()
-        );
-        assert!(activation.try_recv().is_err());
-    } else {
-        controller.drive().unwrap();
-        assert!(
-            activation.try_recv().is_err(),
-            "late enable has not been delivered"
-        );
-        controller
-            .transition
-            .as_mut()
+    assert_eq!(
+        h.seat
+            .get_context(b.as_fd(), Budget::new())
+            .await
             .unwrap()
-            .pending_enable
-            .remove(&late_id);
-        controller.drive().unwrap();
-        assert_eq!(activation.try_recv().unwrap(), Ok(()));
-    }
+            .desired_uids,
+        vec![424243]
+    );
+    h.finish().await;
 }
-
 #[tokio::test]
-async fn late_membership_must_join_the_initial_enable_delivery_barrier() {
-    late_join_delivery_case(false).await;
+async fn one_guard_excludes_queries_during_real_acl_worker_queue_wait() {
+    let h = Fixture::new().await;
+    let (authority, id) = h.seat.create_context(0, Budget::new()).await.unwrap();
+    h.seat
+        .set_grant(authority.as_fd(), 424242, true, Budget::new())
+        .await
+        .unwrap();
+    let quota = h.workers.acquire().await.unwrap();
+    let mut activation = Box::pin(h.seat.activate_context(id, Budget::new()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), activation.as_mut())
+            .await
+            .is_err()
+    );
+    let query = h
+        .seat
+        .list_contexts(Budget {
+            reply: Instant::now() + Duration::from_millis(10),
+        })
+        .await;
+    assert_eq!(query.unwrap_err().kind, ErrorKind::Busy);
+    assert!(h.seat.state.try_read().is_err());
+    drop(quota);
+    activation.await.unwrap();
+    assert!(
+        h.seat
+            .get_context(authority.as_fd(), Budget::new())
+            .await
+            .unwrap()
+            .effective
+    );
+    h.finish().await;
 }
-
 #[tokio::test]
-async fn late_enable_delivery_failure_fences_and_unwinds_initial_activation() {
-    late_join_delivery_case(true).await;
+async fn parent_owned_real_operation_survives_capture_adapter_panic() {
+    use futures_util::StreamExt;
+    let h = Fixture::new().await;
+    let (authority, id) = h.seat.create_context(0, Budget::new()).await.unwrap();
+    h.seat
+        .set_grant(authority.as_fd(), 424242, true, Budget::new())
+        .await
+        .unwrap();
+    let quota = h.workers.acquire().await.unwrap();
+    let mut pending = crate::sources::BrokerWork::new();
+    pending.push(crate::sources::operation(
+        &h.seat,
+        h.seat.activate_context(id, Budget::new()),
+    ));
+    let adapter = AssertUnwindSafe(async {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), pending.next())
+                .await
+                .is_err()
+        );
+        panic!("injected capture failure, not an operation panic");
+    })
+    .catch_unwind()
+    .await;
+    assert!(adapter.is_err());
+    assert_eq!(pending.len(), 1);
+    assert!(
+        h.seat.state.try_read().is_err(),
+        "capture failure dropped the operation guard"
+    );
+    assert!(
+        !h.seat.fatal.failed(),
+        "adapter accidentally cancelled the admitted operation"
+    );
+    h.seat.fatal.fail("parent supervised capture failure");
+    drop(quota);
+    assert_eq!(
+        pending.next().await.unwrap().unwrap_err().kind,
+        ErrorKind::CriticalFailure
+    );
+    drop(pending);
+    assert!(h.seat.state.try_read().is_ok());
+    h.finish().await;
 }
-
-mod access_tests;
-#[cfg(feature = "test-support")]
-mod broker_tests;
-mod terminal_tests;
+#[tokio::test]
+async fn independent_watchdog_fences_even_when_the_parent_future_is_not_polled() {
+    let h = Fixture::new().await;
+    let watchdog = crate::daemon::Watchdog::start(h.seat.fatal.clone()).unwrap();
+    let budget = Budget {
+        reply: Instant::now() + crate::fatal::REPLY_HEADROOM + Duration::from_millis(150),
+    };
+    let mut op = h.seat.write(budget).await.unwrap();
+    op.arm();
+    // Deliberately block this test's single Tokio thread. The deadline owner
+    // must not need that executor or the held State guard to fence admission.
+    std::thread::sleep(Duration::from_millis(250));
+    let fenced = h.seat.fatal.failed();
+    let still_owned = h.seat.state.try_read().is_err();
+    watchdog.finish();
+    assert!(fenced && still_owned);
+    drop(op);
+    assert!(h.seat.state.try_read().is_ok());
+    h.finish().await;
+}
+#[tokio::test]
+async fn cancellation_fences_before_unlock_instead_of_publishing_partial_intent() {
+    let h = Fixture::new().await;
+    let (_authority, id) = h.seat.create_context(0, Budget::new()).await.unwrap();
+    let quota = h.workers.acquire().await.unwrap();
+    let mut activation = Box::pin(h.seat.activate_context(id, Budget::new()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), activation.as_mut())
+            .await
+            .is_err()
+    );
+    drop(activation);
+    assert!(h.seat.fatal.failed());
+    assert!(h.seat.state.try_read().is_ok());
+    assert_eq!(
+        h.seat.list_contexts(Budget::new()).await.unwrap_err().kind,
+        ErrorKind::CriticalFailure
+    );
+    drop(quota);
+    h.finish().await;
+}
+#[tokio::test]
+async fn operation_panic_fences_before_the_tokio_guard_unlocks() {
+    let h = Fixture::new().await;
+    let panic = AssertUnwindSafe(async {
+        let mut op = h.seat.write(Budget::new()).await.unwrap();
+        op.arm();
+        panic!("injected operation panic");
+    })
+    .catch_unwind()
+    .await;
+    assert!(panic.is_err());
+    assert!(h.seat.fatal.failed());
+    assert!(h.seat.state.try_read().is_ok());
+    h.finish().await;
+}
+#[tokio::test]
+async fn hard_effect_deadline_is_critical_even_for_an_empty_acl_target() {
+    let h = Fixture::new().await;
+    let (_authority, id) = h.seat.create_context(0, Budget::new()).await.unwrap();
+    let quota = h.workers.acquire().await.unwrap();
+    let budget = Budget {
+        reply: Instant::now() + crate::fatal::REPLY_HEADROOM + Duration::from_millis(150),
+    };
+    let error = h.seat.activate_context(id, budget).await.unwrap_err();
+    assert_eq!(error.kind, ErrorKind::CriticalFailure);
+    assert!(h.seat.fatal.failed());
+    drop(quota);
+    h.finish().await;
+}
+#[tokio::test]
+async fn authority_loss_during_application_withdraws_and_never_publishes_success() {
+    let h = Fixture::new().await;
+    let (authority, id) = h.seat.create_context(0, Budget::new()).await.unwrap();
+    h.seat
+        .set_grant(authority.as_fd(), 424242, true, Budget::new())
+        .await
+        .unwrap();
+    let quota = h.workers.acquire().await.unwrap();
+    let mut activation = Box::pin(h.seat.activate_context(id, Budget::new()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), activation.as_mut())
+            .await
+            .is_err()
+    );
+    drop(authority);
+    drop(quota);
+    assert_eq!(activation.await.unwrap_err().kind, ErrorKind::NotAuthorized);
+    assert!(
+        h.seat
+            .list_contexts(Budget::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(h.seat.state.read().await.acl.desired_users().is_empty());
+    assert!(!h.seat.fatal.failed());
+    h.finish().await;
+}
+#[tokio::test]
+async fn binding_metadata_is_immutable_and_removal_retry_is_authority_only() {
+    let h = Fixture::new().await;
+    assert_eq!(
+        h.seat
+            .create_context(7, Budget::new())
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidArgument
+    );
+    let (authority, id) = h.seat.create_context(0, Budget::new()).await.unwrap();
+    assert_eq!(
+        h.seat
+            .seat_metadata(authority.as_fd(), Budget::new())
+            .await
+            .unwrap(),
+        ("seat-test".into(), 0)
+    );
+    h.seat
+        .remove_context(authority.as_fd(), Budget::new())
+        .await
+        .unwrap();
+    h.seat
+        .remove_context(authority.as_fd(), Budget::new())
+        .await
+        .unwrap();
+    h.seat
+        .remove_context_by_id(id, Budget::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        h.seat
+            .activate_context(id, Budget::new())
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+    assert_eq!(
+        h.seat
+            .get_context(authority.as_fd(), Budget::new())
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotAuthorized
+    );
+    h.finish().await;
+}

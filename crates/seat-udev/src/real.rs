@@ -174,6 +174,133 @@ impl Context {
     }
 }
 
+/// Owned raw discovery output, not another retained policy inventory.
+#[derive(Clone, Debug)]
+pub struct ResolvedDevice {
+    pub device: SeatDevice,
+    pub assignment: String,
+}
+#[derive(Debug)]
+pub enum PhysicalHint {
+    Add {
+        syspath: PathBuf,
+        identity: (u64, u64),
+    },
+    Remove {
+        syspath: PathBuf,
+    },
+}
+pub struct PhysicalMonitor {
+    monitor: MonitorSocket,
+}
+impl PhysicalMonitor {
+    pub fn new() -> Result<Self, Error> {
+        Ok(Self {
+            monitor: MonitorBuilder::new()
+                .and_then(MonitorBuilder::listen)
+                .map_err(Error::Udev)?,
+        })
+    }
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(self.monitor.as_raw_fd()) }
+    }
+    pub fn receive(&mut self) -> Result<Option<Option<PhysicalHint>>, Error> {
+        let Some(event) = self.monitor.iter().next() else {
+            return Ok(None);
+        };
+        let hint = match event.event_type() {
+            EventType::Remove => Some(PhysicalHint::Remove {
+                syspath: event.syspath().into(),
+            }),
+            EventType::Add if event.is_initialized() => {
+                let device = semantic_initialized_device(&event)?;
+                device.node_identity.map(|identity| PhysicalHint::Add {
+                    syspath: device.syspath,
+                    identity,
+                })
+            }
+            // Assignment/tag CHANGE, bind and unbind are never physical policy input.
+            _ => None,
+        };
+        Ok(Some(hint))
+    }
+}
+fn assignment_key(mut device: Device) -> String {
+    let fallback = format!("node:{}", device.syspath().display());
+    loop {
+        if has_tag(&device, "seat")
+            && let Some(id) = device
+                .property_value("ID_FOR_SEAT")
+                .filter(|id| !id.is_empty())
+        {
+            return format!("group:{}", id.to_string_lossy());
+        }
+        let Some(parent) = device.parent() else {
+            return fallback;
+        };
+        device = parent;
+    }
+}
+pub fn resolve_current(syspath: &Path) -> Result<Option<ResolvedDevice>, Error> {
+    let raw = match Device::from_syspath(syspath) {
+        Ok(device) => device,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENODEV)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(Error::Udev(error)),
+    };
+    let device = match semantic_device(&raw) {
+        Ok(device) => device,
+        Err(Error::NotInitialized(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !device.brokerable() && !device.direct_access() {
+        return Ok(None);
+    }
+    Ok(Some(ResolvedDevice {
+        device,
+        assignment: assignment_key(raw),
+    }))
+}
+#[cfg(feature = "assign")]
+pub struct InventoryScan {
+    pub assignments: std::collections::BTreeMap<String, SeatName>,
+    pub devices: Vec<ResolvedDevice>,
+    pub static_nodes: Vec<PathBuf>,
+}
+#[cfg(feature = "assign")]
+pub fn fresh_inventory() -> Result<InventoryScan, Error> {
+    use crate::assign::{AssignmentBackend, RealAssignmentBackend};
+    let mut assignments = std::collections::BTreeMap::new();
+    for record in RealAssignmentBackend::system()
+        .persisted()
+        .map_err(|error| Error::Udev(io::Error::other(error)))?
+    {
+        assignments.insert(format!("group:{}", record.stable_id), record.seat);
+    }
+    let mut devices = Vec::new();
+    let mut model = Model::default();
+    for device in enumerate_devices()? {
+        model.seed(device.clone());
+        if let Some(resolved) = resolve_current(&device.syspath)? {
+            assignments.insert(resolved.assignment.clone(), resolved.device.seat.clone());
+            devices.push(resolved);
+        }
+    }
+    let static_nodes = discover_static_direct_access_nodes(
+        &model,
+        Path::new("/run/udev/static_node-tags/uaccess"),
+    )?;
+    for path in &static_nodes {
+        assignments.insert(format!("static:{}", path.display()), SeatName::seat0());
+    }
+    Ok(InventoryScan {
+        assignments,
+        devices,
+        static_nodes,
+    })
+}
+
 fn enumerate_devices() -> Result<Vec<SeatDevice>, Error> {
     let mut enumerator = Enumerator::new().map_err(Error::Udev)?;
     enumerator.match_is_initialized().map_err(Error::Udev)?;
@@ -333,7 +460,7 @@ fn current_tag_api() -> Option<HasCurrentTag> {
     })
 }
 
-fn has_tag(device: &Device, wanted: &str) -> bool {
+pub(crate) fn has_tag(device: &Device, wanted: &str) -> bool {
     has_tag_with_api(device, wanted, current_tag_api())
 }
 

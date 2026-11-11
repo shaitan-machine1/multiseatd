@@ -15,7 +15,12 @@ type Acl = *mut c_void;
 unsafe extern "C" {
     fn acl_get_file(path: *const c_char, acl_type: c_int) -> Acl;
     fn acl_from_text(text: *const c_char) -> Acl;
-    fn acl_to_text(acl: Acl, length: *mut isize) -> *mut c_char;
+    fn acl_to_any_text(
+        acl: Acl,
+        prefix: *const c_char,
+        separator: c_char,
+        options: c_int,
+    ) -> *mut c_char;
     fn acl_calc_mask(acl: *mut Acl) -> c_int;
     fn acl_cmp(left: Acl, right: Acl) -> c_int;
     fn acl_set_file(path: *const c_char, acl_type: c_int, acl: Acl) -> c_int;
@@ -31,6 +36,26 @@ pub struct NodeIdentity {
 }
 
 impl NodeIdentity {
+    pub fn observe(path: &Path) -> io::Result<Self> {
+        Self::from_metadata(&std::fs::symlink_metadata(path)?)
+    }
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> io::Result<Self> {
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            number: metadata.rdev(),
+            kind: metadata.mode() & libc::S_IFMT,
+        })
+    }
+    pub fn device_number(self) -> u64 {
+        self.number
+    }
+    pub fn is_device(self) -> bool {
+        matches!(self.kind, libc::S_IFCHR | libc::S_IFBLK)
+    }
     pub fn same_inode(self, expected: (u64, u64)) -> bool {
         (self.device, self.inode) == expected
     }
@@ -98,6 +123,12 @@ pub struct PinnedNode {
     identity: NodeIdentity,
 }
 
+impl PartialEq for PinnedNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+impl Eq for PinnedNode {}
 impl PinnedNode {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new()
@@ -108,12 +139,7 @@ impl PinnedNode {
         if metadata.file_type().is_symlink() {
             return Err(io::Error::from_raw_os_error(libc::ELOOP));
         }
-        let identity = NodeIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            number: metadata.rdev(),
-            kind: metadata.mode() & libc::S_IFMT,
-        };
+        let identity = NodeIdentity::from_metadata(&metadata)?;
         Ok(Self { file, identity })
     }
 
@@ -122,7 +148,13 @@ impl PinnedNode {
     }
 
     pub fn apply(&self, users: &BTreeSet<u32>) -> io::Result<()> {
-        apply_pinned_users(&self.file, self.identity, users).map(|_| ())
+        apply_pinned_users(&self.file, self.identity, users, false).map(|_| ())
+    }
+    pub fn retain_users(&self, allowed: &BTreeSet<u32>) -> io::Result<()> {
+        apply_pinned_users(&self.file, self.identity, allowed, true).map(|_| ())
+    }
+    pub fn is_gone(&self) -> io::Result<bool> {
+        Ok(self.file.metadata()?.nlink() == 0)
     }
 }
 
@@ -160,18 +192,23 @@ fn apply_pinned_users(
     node: &std::fs::File,
     identity: NodeIdentity,
     users: &BTreeSet<u32>,
+    removal_only: bool,
 ) -> io::Result<Option<NodeIdentity>> {
     let path =
         CString::new(format!("/proc/self/fd/{}", node.as_raw_fd())).expect("FD path has no NUL");
     // SAFETY: path names the pinned live inode; the ACL allocation is owned.
     let current_acl = AclObject::owned(unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_ACCESS) })?;
     let current = acl_text(&current_acl)?;
-    let rewritten = CString::new(rewrite_acl(&current, users))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let rewritten = CString::new(if removal_only {
+        remove_unexpected(&current, users)
+    } else {
+        rewrite_acl(&current, users)
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     // SAFETY: rewritten is NUL terminated; libacl returns an owned ACL.
     let mut acl = AclObject::owned(unsafe { acl_from_text(rewritten.as_ptr()) })?;
     // SAFETY: acl is owned and writable; libacl may replace its allocation.
-    if unsafe { acl_calc_mask(&mut acl.0) } == -1 {
+    if !removal_only && unsafe { acl_calc_mask(&mut acl.0) } == -1 {
         return Err(io::Error::last_os_error());
     }
     // Revalidate every time, but avoid redundant xattr writes once the
@@ -204,10 +241,12 @@ fn read_acl(path: &CStr) -> io::Result<String> {
 }
 
 fn acl_text(acl: &AclObject) -> io::Result<String> {
-    let mut length = 0isize;
-    // SAFETY: acl is live and length is writable; the result is owned text.
-    let text = AclObject::owned(unsafe { acl_to_text(acl.0, &mut length) }.cast())?;
-    // SAFETY: acl_to_text returns a NUL-terminated string, still live here.
+    // Numeric IDs avoid NSS-dependent comparisons and permission comments.
+    // SAFETY: acl is live; TEXT_NUMERIC_IDS is 0x08 and the result is owned.
+    let text = AclObject::owned(
+        unsafe { acl_to_any_text(acl.0, std::ptr::null(), b'\n' as c_char, 0x08) }.cast(),
+    )?;
+    // SAFETY: acl_to_any_text returns a NUL-terminated string, still live here.
     Ok(unsafe { CStr::from_ptr(text.0.cast()) }
         .to_string_lossy()
         .into_owned())
@@ -218,15 +257,70 @@ pub(crate) fn test_acl_text(path: &Path) -> String {
     read_acl(&path_cstring(path).unwrap()).unwrap()
 }
 
+fn named(line: &str, tag: &str) -> bool {
+    line.strip_prefix(tag)
+        .and_then(|rest| rest.split(':').next())
+        .is_some_and(|qualifier| !qualifier.is_empty())
+}
+fn permissions(text: &str) -> u8 {
+    text.bytes().fold(0, |bits, byte| {
+        bits | match byte {
+            b'r' => 4,
+            b'w' => 2,
+            b'x' => 1,
+            _ => 0,
+        }
+    })
+}
+fn permission_text(bits: u8) -> String {
+    [
+        if bits & 4 != 0 { 'r' } else { '-' },
+        if bits & 2 != 0 { 'w' } else { '-' },
+        if bits & 1 != 0 { 'x' } else { '-' },
+    ]
+    .into_iter()
+    .collect()
+}
+// Phase one must never introduce a UID or enlarge existing effective rights.
+fn remove_unexpected(current: &str, allowed: &BTreeSet<u32>) -> String {
+    let mut lines = Vec::new();
+    let mut mask = 0;
+    let mut old_mask = 7;
+    for line in current.lines().filter(|line| !line.is_empty()) {
+        if let Some(value) = line.strip_prefix("mask::") {
+            old_mask = permissions(value);
+            continue;
+        }
+        if named(line, "group:") {
+            continue;
+        }
+        if named(line, "user:") {
+            let mut fields = line.split(':');
+            fields.next();
+            let uid = fields.next().and_then(|id| id.parse::<u32>().ok());
+            let Some(uid) = uid.filter(|id| allowed.contains(id)) else {
+                continue;
+            };
+            let rights = permissions(fields.next().unwrap_or("")) & 6;
+            mask |= rights;
+            lines.push(format!("user:{uid}:{}", permission_text(rights)));
+        } else {
+            if let Some(value) = line.strip_prefix("group::") {
+                mask |= permissions(value);
+            }
+            lines.push(line.to_owned());
+        }
+    }
+    lines.push(format!("mask::{}", permission_text(mask & old_mask)));
+    lines.push(String::new());
+    lines.join("\n")
+}
+
 fn rewrite_acl(current: &str, users: &BTreeSet<u32>) -> String {
     let mut retained = Vec::new();
     let mut inserted = false;
     for line in current.lines().filter(|line| !line.trim().is_empty()) {
-        let is_named_user = line
-            .strip_prefix("user:")
-            .and_then(|rest| rest.split(':').next())
-            .is_some_and(|qualifier| !qualifier.is_empty());
-        if is_named_user {
+        if named(line, "user:") || named(line, "group:") {
             continue;
         }
         if !inserted && line.starts_with("group:") {
@@ -251,16 +345,16 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn replaces_named_users_and_preserves_owner_groups_and_other() {
+    fn replaces_all_named_entries_and_preserves_base_owner_group_other() {
         let current =
             "user::rw-\nuser:1000:r--\ngroup::r--\ngroup:audio:rw-\nmask::rw-\nother::---\n";
         assert_eq!(
             rewrite_acl(current, &BTreeSet::from([1001, 1002])),
-            "user::rw-\nuser:1001:rw-\nuser:1002:rw-\ngroup::r--\ngroup:audio:rw-\nother::---\n"
+            "user::rw-\nuser:1001:rw-\nuser:1002:rw-\ngroup::r--\nother::---\n"
         );
         assert_eq!(
             rewrite_acl(current, &BTreeSet::new()),
-            "user::rw-\ngroup::r--\ngroup:audio:rw-\nother::---\n"
+            "user::rw-\ngroup::r--\nother::---\n"
         );
     }
 
@@ -285,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn libacl_preserves_named_groups_while_replacing_named_users() {
+    fn libacl_removes_unexpected_named_groups_and_users() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let path = path_cstring(file.path()).unwrap();
         let original = CString::new(
@@ -305,11 +399,33 @@ mod tests {
         let replaced = read_acl(&path).unwrap();
         assert!(!replaced.contains("user:424242:"));
         assert!(replaced.contains("user:424244:rw-"));
-        assert!(replaced.contains("group:424243:rw-"));
+        assert!(!replaced.contains("group:424243:"));
         LibAcl.set_users(file.path(), &BTreeSet::new()).unwrap();
         let cleared = read_acl(&path).unwrap();
-        assert!(cleared.contains("group:424243:rw-"));
-        assert!(cleared.contains("mask::rw-"));
+        assert!(!cleared.contains("group:424243:"));
+        assert!(cleared.contains("mask::r--"));
+    }
+
+    #[test]
+    fn removal_only_never_adds_users_or_expands_masked_permissions() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = path_cstring(file.path()).unwrap();
+        let original = CString::new("user::rw-\nuser:424242:rw-\nuser:424243:rw-\ngroup::r--\ngroup:424244:rw-\nmask::r--\nother::---\n").unwrap();
+        let acl = AclObject::owned(unsafe { acl_from_text(original.as_ptr()) }).unwrap();
+        assert_eq!(
+            unsafe { acl_set_file(path.as_ptr(), ACL_TYPE_ACCESS, acl.0) },
+            0
+        );
+        PinnedNode::open(file.path())
+            .unwrap()
+            .retain_users(&BTreeSet::from([424242, 424245]))
+            .unwrap();
+        let actual = read_acl(&path).unwrap();
+        assert!(actual.contains("user:424242:rw-"));
+        assert!(actual.contains("mask::r--"));
+        for removed in ["user:424243:", "user:424245:", "group:424244:"] {
+            assert!(!actual.contains(removed));
+        }
     }
 
     #[test]
