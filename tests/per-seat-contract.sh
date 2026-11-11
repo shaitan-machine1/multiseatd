@@ -22,9 +22,9 @@ if [ -n "${CONTEXT_NATIVE_CLIENT:-}" ]; then
     cp "$CONTEXT_NATIVE_CLIENT" "$base/tools/native-client"; chmod 755 "$base/tools/native-client"
     CONTEXT_NATIVE_CLIENT="$base/tools/native-client"; export CONTEXT_NATIVE_CLIENT
 fi
-if [ -n "${CONTEXT_SEAT_LAUNCH:-}" ]; then
-    cp "$CONTEXT_SEAT_LAUNCH" "$base/tools/seat-launch"; chmod 755 "$base/tools/seat-launch"
-    CONTEXT_SEAT_LAUNCH="$base/tools/seat-launch"; export CONTEXT_SEAT_LAUNCH
+if [ -n "${CONTEXT_WITH_SEAT:-}" ]; then
+    cp "$CONTEXT_WITH_SEAT" "$base/tools/with-seat"; chmod 755 "$base/tools/with-seat"
+    CONTEXT_WITH_SEAT="$base/tools/with-seat"; export CONTEXT_WITH_SEAT
 fi
 : > "$base/fixtures/node"
 bus_pid=

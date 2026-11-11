@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "dev-acl"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "libc",
  "tempfile",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "dev-broker"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "libc",
  "nix",
@@ -302,7 +302,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lib-multiseatd"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "dbus",
  "libc",
@@ -342,7 +342,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "linux-vt"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "futures-channel",
  "libc",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "multiseatd"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "dbus",
@@ -521,17 +521,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "seat-launch"
-version = "0.4.0"
-dependencies = [
- "clap",
- "lib-multiseatd",
- "libc",
-]
-
-[[package]]
 name = "seat-udev"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "libc",
  "nix",
@@ -540,6 +531,15 @@ dependencies = [
  "thiserror",
  "udev",
  "uuid",
+]
+
+[[package]]
+name = "seat-wrapper"
+version = "0.4.1"
+dependencies = [
+ "clap",
+ "lib-multiseatd",
+ "libc",
 ]
 
 [[package]]

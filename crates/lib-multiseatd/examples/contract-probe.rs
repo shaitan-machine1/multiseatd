@@ -388,11 +388,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|value| !value.is_empty())
     {
         libseat_case(&client, address, seat, &executable, None, false)?;
-        if let Ok(launcher) = std::env::var("CONTEXT_SEAT_LAUNCH") {
+        if let Ok(launcher) = std::env::var("CONTEXT_WITH_SEAT") {
             libseat_case(&client, address, seat, &executable, Some(&launcher), false)?;
         }
         println!(
-            "maintained C libseat opens, duplicate FDs, close/reopen, no authority and seat-launch acceptance passed"
+            "maintained C libseat opens, duplicate FDs, close/reopen, no authority and with-seat acceptance passed"
         );
     }
     if let Some(executable) = std::env::var("CONTEXT_NATIVE_CLIENT")

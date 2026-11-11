@@ -1,5 +1,5 @@
 [package]
-name = "seat-launch"
+name = "seat-wrapper"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

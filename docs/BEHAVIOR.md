@@ -94,6 +94,6 @@ Unit tests cover framing/ancillary ownership, retained broker jobs/identities,
 exact real temporary-file ACLs, cancellation/panic/adapter lifetimes, deadline
 watchdog and synthetic VT policy. Root private-bus harnesses cover real SDK calls,
 credentials, sibling/authority lifetimes, post-write faults and maintained C
-libseat/seat-launch execution. /dev/null and fake-VT fixtures do not establish
+libseat/with-seat execution. /dev/null and fake-VT fixtures do not establish
 physical DRM/input/hidraw revocation, real native VT switching or authenticated
 graphical-login acceptance; those require separately reviewed isolated deployment.

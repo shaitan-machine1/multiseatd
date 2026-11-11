@@ -5,7 +5,9 @@ access. Each independently configured daemon owns one seat. There is no global
 controller, peer discovery, automatic takeover or compatibility API.
 
 The seven crates are `multiseatd`, `lib-multiseatd` (Rust `libmultiseatd`),
-`dev-broker`, `dev-acl`, `linux-vt`, `seat-udev` and `seat-launch`.
+`dev-broker`, `dev-acl`, `linux-vt`, `seat-udev` and `seat-wrapper`.
+`seat-wrapper` builds `with-seat` and `without-seat`, installed under
+`/usr/libexec/multiseatd/`.
 [API](docs/API.md) · [behavior and limits](docs/BEHAVIOR.md).
 
 ## Operation
@@ -43,14 +45,21 @@ Trusted launch code performs PAM, credential changes and detachment. At the fina
 compositor exec boundary it explicitly delegates authority:
 
 ```sh
-MULTISEATD_AUTHORITY_FD=3 /usr/libexec/multiseatd/seat-launch --seat seat0 /usr/bin/weston
+MULTISEATD_AUTHORITY_FD=3 /usr/libexec/multiseatd/with-seat --seat seat0 /usr/bin/weston
 ```
 
-FD 3 must actually be inherited from the privileged host. Seat-launch obtains a
+FD 3 must actually be inherited from the privileged host. `with-seat` obtains a
 fresh connection, verifies immutable metadata, closes authority/unlisted FDs and
-execs. It never activates, performs PAM or changes credentials. Ordinary programs
-receive neither context authority nor a Linux controlling terminal. Do not pass
-authority through untrusted scripts/loaders.
+execs. It never activates, performs PAM or changes credentials. Alternatively,
+a compositor linked against the maintained native libseat backend may directly
+consume the authority with `LIBSEAT_BACKEND=multiseatd`, without a wrapper.
+
+`without-seat COMMAND ...` closes all nonstandard inherited FDs and clears seat
+capabilities/backend overrides before exec. It refuses socket standard IO because
+that could retain a capability duplicate, while allowing files, pipes and PTYs.
+Ordinary session metadata such as `XDG_SEAT` is retained. It does not remove UID
+ACL grants, revoke another process's access or sandbox the command. Both wrappers
+reject a controlling Linux VT. Do not pass authority through untrusted scripts/loaders.
 
 ## Build and validation
 

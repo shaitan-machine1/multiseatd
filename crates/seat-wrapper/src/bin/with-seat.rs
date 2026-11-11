@@ -1,9 +1,7 @@
 use clap::Parser;
 use libmultiseatd::{Client, launch};
 use std::ffi::OsString;
-use std::io;
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
 
 #[derive(Parser)]
 #[command(
@@ -25,13 +23,12 @@ struct Args {
 }
 fn main() {
     if let Err(error) = run(Args::parse()) {
-        eprintln!("seat-launch: {error}");
+        eprintln!("with-seat: {error}");
         std::process::exit(1);
     }
 }
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    launch::fill_standard_streams()?;
-    launch::check_no_linux_terminal()?;
+    seat_wrapper::prepare()?;
     let raw = match args.authority_fd {
         Some(fd) => fd,
         None => std::env::var("MULTISEATD_AUTHORITY_FD")?.parse()?,
@@ -73,15 +70,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let descriptor = connection.into_fd();
     drop(client);
     drop(authority);
-    if std::fs::read_dir("/proc/self/task")?.count() != 1 {
-        return Err("seat-launch requires a single-threaded exec worker".into());
-    }
+    seat_wrapper::clear_seat_environment()?;
     use std::os::fd::AsRawFd;
     let raw = descriptor.as_raw_fd();
     // SAFETY: the process is single-threaded; no library worker is running.
     unsafe {
-        std::env::remove_var("MULTISEATD_AUTHORITY_FD");
-        std::env::remove_var("MULTISEATD_CONTEXT_ID");
         std::env::set_var("LIBSEAT_BACKEND", "seatd");
         std::env::set_var("SEATD_FD", raw.to_string());
         std::env::set_var("XDG_SEAT", seat);
@@ -95,13 +88,6 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         launch::close_unlisted(&[raw])?;
     }
     launch::inheritable(descriptor.as_fd(), true)?;
-    let error = std::process::Command::new(&args.command[0])
-        .args(&args.command[1..])
-        .exec();
     // Exec failure drops the connection, never its context or siblings.
-    Err(io::Error::other(format!(
-        "exec {}: {error}",
-        args.command[0].to_string_lossy()
-    ))
-    .into())
+    Err(seat_wrapper::exec(&args.command).into())
 }

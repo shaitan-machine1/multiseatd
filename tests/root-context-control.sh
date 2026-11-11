@@ -7,8 +7,8 @@ for command in cargo sudo timeout; do command -v "$command" >/dev/null 2>&1 || e
 sudo -n true || exit 77
 cargo build --manifest-path "$repo/Cargo.toml" -p multiseatd --no-default-features --features test-support
 cargo build --manifest-path "$repo/Cargo.toml" -p lib-multiseatd --example contract-probe
-cargo build --manifest-path "$repo/Cargo.toml" -p seat-launch
+cargo build --manifest-path "$repo/Cargo.toml" -p seat-wrapper
 sudo -n env TEST_ACL_FAULT="${TEST_ACL_FAULT:-}" CONTEXT_LIBSEAT_CLIENT="${CONTEXT_LIBSEAT_CLIENT:-}" \
-    CONTEXT_NATIVE_CLIENT="${CONTEXT_NATIVE_CLIENT:-}" CONTEXT_SEAT_LAUNCH="$repo/target/debug/seat-launch" \
+    CONTEXT_NATIVE_CLIENT="${CONTEXT_NATIVE_CLIENT:-}" CONTEXT_WITH_SEAT="$repo/target/debug/with-seat" \
     timeout --signal=TERM --kill-after=5s 60s "$repo/tests/per-seat-contract.sh" \
     "$repo/target/debug/multiseatd" "$repo/target/debug/examples/contract-probe"
