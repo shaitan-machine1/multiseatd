@@ -36,6 +36,7 @@ struct Context {
     grants: BTreeSet<u32>,
     connections: BTreeMap<ConnectionKey, Connection>,
     lifetime: Registration,
+    _master_watch: watch::Sender<()>,
 }
 struct Applied {
     context: ContextId,
@@ -84,6 +85,9 @@ pub struct Seat {
     broker: broker::Control,
     discovery: discovery::Control,
     changed: watch::Sender<u64>,
+    master_watches: tokio::sync::mpsc::Sender<crate::master::MasterWatch>,
+    master_receiver:
+        std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::master::MasterWatch>>>,
     #[cfg(feature = "vt")]
     vt: linux_vt::Control,
     #[cfg(feature = "vt")]
@@ -184,6 +188,7 @@ impl Seat {
         #[cfg(feature = "vt")] configured_vts: BTreeSet<u32>,
     ) -> io::Result<Self> {
         let (changed, _) = watch::channel(0);
+        let (master_watches, master_receiver) = tokio::sync::mpsc::channel(CONTEXT_LIMIT);
         let mut acl = AclRegistry::new(NODE_LIMIT, workers)?;
         let alive = fatal.gate();
         acl.set_lifetime(move || alive.load(std::sync::atomic::Ordering::Acquire));
@@ -212,6 +217,8 @@ impl Seat {
             broker,
             discovery,
             changed,
+            master_watches,
+            master_receiver: std::sync::Mutex::new(Some(master_receiver)),
             #[cfg(feature = "vt")]
             vt,
             #[cfg(feature = "vt")]
@@ -542,7 +549,44 @@ impl Seat {
         .await;
         op.settle(result)
     }
+    pub fn take_master_watches(&self) -> tokio::sync::mpsc::Receiver<crate::master::MasterWatch> {
+        self.master_receiver
+            .lock()
+            .expect("master receiver poisoned")
+            .take()
+            .expect("one observer")
+    }
+    #[cfg(test)]
     pub async fn create_context(&self, vt: u32, budget: Budget) -> Result<(OwnedFd, ContextId)> {
+        self.create_context_for_master(vt, crate::master::Master::current(), budget)
+            .await
+    }
+    pub async fn create_context_for_master(
+        &self,
+        vt: u32,
+        master: Arc<crate::master::Master>,
+        budget: Budget,
+    ) -> Result<(OwnedFd, ContextId)> {
+        if !master
+            .is_alive()
+            .map_err(|e| Error::new(ErrorKind::NotAuthorized, e.to_string()))?
+        {
+            return Err(Error::new(
+                ErrorKind::NotAuthorized,
+                "context master exited",
+            ));
+        }
+        // SAFETY: this duplicate is used only for readiness; no asynchronous I/O
+        // operation consumes or replaces the authenticated process handle.
+        let watched = unsafe {
+            tokio::io::unix::AsyncFd::register(
+                master
+                    .as_ref()
+                    .fd_clone()
+                    .map_err(|e| Error::new(ErrorKind::LimitExceeded, e.to_string()))?,
+            )
+        }
+        .map_err(|e| Error::new(ErrorKind::LimitExceeded, e.to_string()))?;
         #[cfg(not(feature = "vt"))]
         if vt != 0 {
             return Err(Error::invalid("non-VT seat accepts binding zero only"));
@@ -557,15 +601,27 @@ impl Seat {
         if op.contexts.len() == CONTEXT_LIMIT {
             return Err(Error::new(ErrorKind::LimitExceeded, "context limit"));
         }
+        let watch_slot = self
+            .master_watches
+            .try_reserve()
+            .map_err(|_| Error::new(ErrorKind::LimitExceeded, "master observer admission full"))?;
         let issued = op
             .authorities
             .issue()
             .map_err(|error| self.authority_error(error))?;
         op.arm();
-        let lifetime = op
+        let mut lifetime = op
             .authorities
             .registration(issued.context)
             .map_err(|error| self.authority_error(error))?;
+        lifetime.master = Some(master.clone());
+        let (cancel, cancelled) = watch::channel(());
+        watch_slot.send(crate::master::MasterWatch {
+            id: issued.context,
+            fd: watched,
+            cancelled,
+            master,
+        });
         op.contexts.insert(
             issued.context,
             Context {
@@ -574,10 +630,16 @@ impl Seat {
                 grants: BTreeSet::new(),
                 connections: BTreeMap::new(),
                 lifetime,
+                _master_watch: cancel,
             },
         );
         self.changed();
-        op.settle(Ok((issued.endpoint, issued.context)))
+        let deadline = op.deadline;
+        let result = self
+            .finish_live(&mut op, issued.context, deadline)
+            .await
+            .map(|()| (issued.endpoint, issued.context));
+        op.settle(result)
     }
     pub async fn activate_context(&self, id: ContextId, budget: Budget) -> Result<()> {
         let mut op = self.write(budget).await?;
@@ -691,6 +753,7 @@ impl Seat {
             .authorities
             .resolve(authority)
             .map_err(|error| self.authority_error(error))?;
+        self.live(&op, id)?;
         let context = &op.contexts[&id];
         if add && context.grants.len() == 64 && !context.grants.contains(&uid) {
             return Err(Error::new(ErrorKind::LimitExceeded, "context UID limit"));
@@ -729,6 +792,7 @@ impl Seat {
             .authorities
             .resolve(authority)
             .map_err(|error| self.authority_error(error))?;
+        self.live(&op, id)?;
         if op.contexts[&id].connections.len() == CONNECTION_LIMIT {
             return Err(Error::new(
                 ErrorKind::LimitExceeded,
@@ -834,6 +898,7 @@ impl Seat {
             .authorities
             .resolve(authority)
             .map_err(|error| self.authority_error(error))?;
+        self.live(&state, id)?;
         self.info(&state, id)
     }
     pub async fn seat_metadata(
@@ -846,6 +911,7 @@ impl Seat {
             .authorities
             .resolve(authority)
             .map_err(|error| self.authority_error(error))?;
+        self.live(&state, id)?;
         #[cfg(not(feature = "vt"))]
         {
             let _ = id;
@@ -855,6 +921,46 @@ impl Seat {
         {
             Ok((self.name.as_str().into(), state.contexts[&id].vt))
         }
+    }
+    pub async fn get_context_by_master_pid(
+        &self,
+        pid: u32,
+        start: u64,
+        budget: Budget,
+    ) -> Result<ContextInfo> {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return Err(Error::invalid("invalid master PID"));
+        }
+        let state = self.read(budget).await?;
+        let mut found = None;
+        for (&id, context) in &state.contexts {
+            if let Some(master) = &context.lifetime.master
+                && master.pid == pid
+                && master.start_time == start
+                && context
+                    .lifetime
+                    .is_alive()
+                    .map_err(|e| Error::new(ErrorKind::NotReady, e.to_string()))?
+            {
+                if found.is_some() {
+                    return Err(Error::new(
+                        ErrorKind::AmbiguousContext,
+                        "multiple live contexts for exact master",
+                    ));
+                }
+                found = Some(id);
+            }
+        }
+        self.info(
+            &state,
+            found.ok_or_else(|| {
+                Error::new(ErrorKind::NotFound, "no live exact-master association")
+            })?,
+        )
+    }
+    pub async fn master_exited(&self, id: ContextId) -> Result<()> {
+        self.changed();
+        self.remove_context_by_id(id, Budget::new()).await
     }
     pub async fn list_contexts(&self, budget: Budget) -> Result<Vec<ContextInfo>> {
         let state = self.read(budget).await?;

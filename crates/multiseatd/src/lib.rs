@@ -6,6 +6,7 @@ pub mod dbus;
 pub mod discovery;
 pub mod fatal;
 pub mod instance;
+pub mod master;
 pub mod seat;
 pub mod sources;
 pub use dev_broker::{device, seatd};

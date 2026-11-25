@@ -13,6 +13,7 @@ pub use refresh::{
 
 use dbus::arg::{AppendAll, ReadAll};
 use dbus::blocking::{BlockingSender, Connection};
+use std::cell::Cell;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,7 @@ pub struct Client {
     seat: String,
     name: String,
     owner: String,
+    buffered: Cell<bool>,
 }
 impl Client {
     pub fn system(seat: &str) -> Result<Self, dbus::Error> {
@@ -60,21 +62,27 @@ impl Client {
     }
     pub fn system_with_timeout(seat: &str, timeout: Duration) -> Result<Self, dbus::Error> {
         validate(seat, timeout)?;
-        Self::from_connection(Connection::new_system()?, seat, timeout)
+        Self::from_channel(
+            dbus::channel::Channel::get_private(dbus::channel::BusType::System)?,
+            seat,
+            timeout,
+        )
     }
     /// Explicit private-bus/test integration. Never changes the process environment.
     pub fn for_address(address: &str, seat: &str, timeout: Duration) -> Result<Self, dbus::Error> {
         validate(seat, timeout)?;
         let mut channel = dbus::channel::Channel::open_private(address)?;
         channel.register()?;
-        Self::from_connection(channel.into(), seat, timeout)
+        Self::from_channel(channel, seat, timeout)
     }
-    pub fn from_connection(
-        connection: Connection,
+    pub fn from_channel(
+        mut channel: dbus::channel::Channel,
         seat: &str,
         timeout: Duration,
     ) -> Result<Self, dbus::Error> {
         let name = validate(seat, timeout)?;
+        channel.set_watch_enabled(true);
+        let connection = Connection::from(channel);
         let deadline = Instant::now() + timeout;
         let (owner,): (String,) =
             bus_call(&connection, remaining(deadline)?, "GetNameOwner", (&name,))?;
@@ -96,6 +104,7 @@ impl Client {
             seat: seat.into(),
             name,
             owner,
+            buffered: Cell::new(true),
         })
     }
     pub fn seat(&self) -> &str {
@@ -111,6 +120,7 @@ impl Client {
         self.verify_owner_until(Instant::now() + self.timeout)
     }
     fn verify_owner_until(&self, deadline: Instant) -> Result<(), dbus::Error> {
+        self.buffered.set(true);
         let (current,): (String,) = bus_call(
             &self.connection,
             remaining(deadline)?,
@@ -196,6 +206,17 @@ impl Client {
         let (info,) = self.call("GetContext", (argument(authority)?,))?;
         Ok(info)
     }
+    pub fn get_context_by_master_pid(
+        &self,
+        pid: u32,
+        start_time: u64,
+    ) -> Result<ContextInfo, dbus::Error> {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return Err(ErrorKind::InvalidArgument.error("invalid master PID"));
+        }
+        let (context,) = self.call("GetContextByMasterPid", (pid, start_time))?;
+        Ok(context)
+    }
     pub fn list_contexts(&self) -> Result<Vec<ContextInfo>, dbus::Error> {
         let (contexts,) = self.call("ListContexts", ())?;
         Ok(contexts)
@@ -206,7 +227,7 @@ impl Client {
     pub fn add_assigned_devices(&self) -> Result<(), dbus::Error> {
         self.call("AddAssignedDevices", ())
     }
-    /// Root-only coalesced requery hints. The caller explicitly drives process().
+    /// Public coalesced requery hints. The caller explicitly drives dispatch().
     pub fn subscribe(
         &self,
         mut callback: impl FnMut(u64) + Send + 'static,
@@ -221,14 +242,35 @@ impl Client {
                 callback(revision);
                 true
             })?;
-        if let Err(error) = self.list_contexts() {
+        if let Err(error) = self.verify_owner() {
             let _ = self.connection.remove_match(token);
             return Err(error);
         }
         Ok(token)
     }
+    /// Caller-owned poll state. A true buffered flag requires immediate dispatch;
+    /// there are no asynchronous RPC timers, so the transport timeout is None.
+    pub fn poll_state(&self) -> (dbus::channel::Watch, bool, Option<Duration>) {
+        (self.connection.channel().watch(), self.buffered.get(), None)
+    }
+    /// Dispatch at most limit messages without blocking. True means more work may remain.
+    pub fn dispatch(&self, limit: usize) -> Result<bool, dbus::Error> {
+        if !(1..=256).contains(&limit) {
+            return Err(ErrorKind::InvalidArgument.error("dispatch limit must be 1..256"));
+        }
+        for _ in 0..limit {
+            if !self.connection.process(Duration::ZERO)? {
+                self.buffered.set(false);
+                return Ok(false);
+            }
+        }
+        self.buffered.set(true);
+        Ok(true)
+    }
     pub fn process(&self, timeout: Duration) -> Result<bool, dbus::Error> {
-        self.connection.process(timeout)
+        let result = self.connection.process(timeout);
+        self.buffered.set(result.as_ref().copied().unwrap_or(false));
+        result
     }
 }
 

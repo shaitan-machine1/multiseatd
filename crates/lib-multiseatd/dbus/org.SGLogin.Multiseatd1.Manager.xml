@@ -30,6 +30,11 @@
       <arg name="connection" type="h" direction="out"/>
       <arg name="handle" type="u" direction="out"/>
     </method>
+    <method name="GetContextByMasterPid">
+      <arg name="pid" type="u" direction="in"/>
+      <arg name="start_time" type="t" direction="in"/>
+      <arg name="context" type="(suauaubbb)" direction="out"/>
+    </method>
     <method name="GetContext">
       <arg name="authority" type="h" direction="in"/>
       <!-- id, vt, desired_uids, connection_handles, active, foreground, effective -->

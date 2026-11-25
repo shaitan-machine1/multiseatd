@@ -91,12 +91,27 @@ pub async fn run_control<'a>(
     let mut prune = false;
     let mut tick = interval(Duration::from_millis(100));
     let mut changes = seat.changes();
+    let mut incoming = seat.take_master_watches();
+    let mut masters = FuturesUnordered::new();
     loop {
         tokio::select! {
             finished = work.next(), if !work.is_empty() => if matches!(finished, Some(ControlDone::Prune)) { prune = false; },
             request = requests.recv(), if work.len() < 64 => {
                 let request = request.ok_or_else(|| seat.fatal().fail("control capture owner stopped"))?;
                 work.push(call(request, seat, replies.clone()).boxed_local());
+            }
+            watch = incoming.recv(), if masters.len() < 128 => {
+                if let Some(watch) = watch { masters.push(watch.wait().boxed_local()); }
+            }
+            result = masters.next(), if !masters.is_empty() && work.len() < 64 => {
+                match result {
+                    Some(Ok(Some(id))) => work.push(async move {
+                        let _ = operation(seat, seat.master_exited(id)).await;
+                        ControlDone::Call
+                    }.boxed_local()),
+                    Some(Err(e)) => return Err(seat.fatal().fail(format!("master observation: {e}"))),
+                    _ => {},
+                }
             }
             _ = changes.changed() => replies.state_changed(*changes.borrow_and_update()),
             _ = tick.tick(), if !prune && work.len() < 64 => {

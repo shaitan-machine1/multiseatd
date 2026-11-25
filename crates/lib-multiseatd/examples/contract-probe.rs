@@ -405,7 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!(
-        "private-bus fourteen-method SDK, credentials, ACL, sibling and authority lifetime acceptance passed"
+        "private-bus fifteen-method SDK, credentials, ACL, sibling and authority lifetime acceptance passed"
     );
     Ok(())
 }

@@ -63,6 +63,81 @@ impl Fixture {
     }
 }
 #[tokio::test]
+async fn exact_master_lookup_is_ambiguous_and_dead_lookup_is_read_only() {
+    use std::os::fd::FromRawFd;
+    let h = Fixture::new().await;
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) as i32 };
+    assert!(raw >= 0);
+    let master = crate::master::Master::acquire(unsafe { OwnedFd::from_raw_fd(raw) }).unwrap();
+    let (a, id) = h
+        .seat
+        .create_context_for_master(0, master.clone(), Budget::new())
+        .await
+        .unwrap();
+    let delegate = a.try_clone().unwrap();
+    assert_eq!(
+        h.seat
+            .get_context_by_master_pid(master.pid, master.start_time, Budget::new())
+            .await
+            .unwrap()
+            .id,
+        id
+    );
+    let (b, second) = h
+        .seat
+        .create_context_for_master(0, master.clone(), Budget::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        h.seat
+            .get_context_by_master_pid(master.pid, master.start_time, Budget::new())
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::AmbiguousContext
+    );
+    h.seat
+        .remove_context_by_id(second, Budget::new())
+        .await
+        .unwrap();
+    drop(b);
+    h.seat.activate_context(id, Budget::new()).await.unwrap();
+    let revision = *h.seat.changes().borrow();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        h.seat
+            .get_context_by_master_pid(master.pid, master.start_time, Budget::new())
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+    assert_eq!(*h.seat.changes().borrow(), revision);
+    assert!(!h.seat.list_contexts(Budget::new()).await.unwrap()[0].effective);
+    assert!(
+        h.seat
+            .create_connection(delegate.as_fd(), Budget::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(h.seat.state.read().await.contexts.len(), 1);
+    h.seat.master_exited(id).await.unwrap();
+    assert!(
+        h.seat
+            .list_contexts(Budget::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop((a, delegate));
+    h.finish().await;
+}
+#[tokio::test]
 async fn occupied_activation_rejects_before_effects_and_never_replaces() {
     let h = Fixture::new().await;
     let (a, first) = h.seat.create_context(0, Budget::new()).await.unwrap();

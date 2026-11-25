@@ -1,13 +1,15 @@
 //! Single-channel nonblocking D-Bus pump with authenticated root lookups and
 //! actual libdbus output-flush acknowledgements. No hidden bus worker/runtime.
 use crate::fatal::{FLUSH_LIMIT, Fatal};
+use crate::master::Master;
 use dbus::channel::{BusType, Channel};
 use dbus::{Message, MessageType};
 use libmultiseatd::ErrorKind;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{Interest, unix::AsyncFd};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -18,6 +20,7 @@ const BUS_PATH: &str = "/org/freedesktop/DBus";
 pub struct Request {
     pub message: Message,
     pub uid: Option<u32>,
+    pub master: Option<Arc<Master>>,
     pub received: Instant,
 }
 struct Output {
@@ -69,7 +72,7 @@ pub struct BusIo {
     cache_order: VecDeque<String>,
     revision: watch::Receiver<u64>,
     signal_revision: u64,
-    signal_peers: VecDeque<String>,
+    signal_pending: bool,
 }
 impl BusIo {
     pub fn connect(
@@ -105,7 +108,7 @@ impl BusIo {
                 cache_order: VecDeque::new(),
                 revision,
                 signal_revision: 0,
-                signal_peers: VecDeque::new(),
+                signal_pending: false,
             },
             receiver,
             Replies(sender, revisions),
@@ -200,27 +203,17 @@ impl BusIo {
             }
             if self.revision.has_changed().unwrap_or(false) {
                 self.signal_revision = *self.revision.borrow_and_update();
-                self.signal_peers = self
-                    .cache
-                    .iter()
-                    .filter(|(_, uid)| **uid == 0)
-                    .map(|(peer, _)| peer.clone())
-                    .collect();
+                self.signal_pending = true;
             }
-            if !self.channel.has_messages_to_send()
-                && let Some(peer) = self.signal_peers.pop_front()
-                && self.cache.get(&peer) == Some(&0)
-            {
-                let mut message = Message::new_signal(
+            if !self.channel.has_messages_to_send() && self.signal_pending {
+                self.signal_pending = false;
+                let message = Message::new_signal(
                     libmultiseatd::OBJECT_PATH,
                     libmultiseatd::INTERFACE_NAME,
                     "StateChanged",
                 )
                 .map_err(io::Error::other)?
                 .append1(self.signal_revision);
-                message.set_destination(Some(
-                    dbus::strings::BusName::new(peer).expect("authenticated unique name"),
-                ));
                 self.channel
                     .send(message)
                     .map_err(|_| io::Error::other("state hint send failed"))?;
@@ -255,7 +248,13 @@ impl BusIo {
             let _ = self.channel.send(error_reply(request, kind, reason));
         }
     }
-    fn forward(&self, message: Message, uid: Option<u32>, received: Instant) {
+    fn forward(
+        &self,
+        message: Message,
+        uid: Option<u32>,
+        master: Option<Arc<Master>>,
+        received: Instant,
+    ) {
         if self.fatal.stopping() {
             self.reject(&message, ErrorKind::Stopping, "seat is stopping");
             return;
@@ -263,6 +262,7 @@ impl BusIo {
         if let Err(error) = self.requests.try_send(Request {
             message,
             uid,
+            master,
             received,
         }) {
             self.reject(
@@ -272,11 +272,42 @@ impl BusIo {
             );
         }
     }
-    fn message(&mut self, message: Message) -> io::Result<()> {
+    fn message(&mut self, mut message: Message) -> io::Result<()> {
         if from_bus(&message) {
             if let Some(serial) = message.get_reply_serial()
                 && let Some(pending) = self.credentials.remove(&serial)
             {
+                if pending.request.member().as_deref() == Some("CreateContext") {
+                    let acquired = (|| -> io::Result<Arc<Master>> {
+                        message.as_result().map_err(io::Error::other)?;
+                        let credentials = message
+                            .read1::<dbus::arg::PropMap>()
+                            .map_err(io::Error::other)?;
+                        if credentials.get("UnixUserID").and_then(|v| v.0.as_u64()) != Some(0) {
+                            return Err(io::Error::other("authenticated root is required"));
+                        }
+                        let fd = credentials
+                            .get("ProcessFD")
+                            .and_then(|v| v.0.as_any().downcast_ref::<std::fs::File>())
+                            .ok_or_else(|| {
+                                io::Error::other(
+                                    "bus ProcessFD is required; no numeric-PID fallback",
+                                )
+                            })?;
+                        let fd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) }
+                            .try_clone_to_owned()?;
+                        Master::acquire(fd)
+                    })();
+                    match acquired {
+                        Ok(master) => {
+                            self.forward(pending.request, Some(0), Some(master), pending.received)
+                        }
+                        Err(e) => {
+                            self.reject(&pending.request, ErrorKind::NotAuthorized, &e.to_string())
+                        }
+                    }
+                    return Ok(());
+                }
                 match message.read1::<u32>() {
                     Ok(uid) if message.msg_type() == MessageType::MethodReturn => {
                         if self.cache.len() == 512
@@ -287,7 +318,7 @@ impl BusIo {
                         if self.cache.insert(pending.sender.clone(), uid).is_none() {
                             self.cache_order.push_back(pending.sender);
                         }
-                        self.forward(pending.request, Some(uid), pending.received);
+                        self.forward(pending.request, Some(uid), None, pending.received);
                     }
                     _ => self.reject(
                         &pending.request,
@@ -306,6 +337,7 @@ impl BusIo {
             {
                 self.cache.remove(&name);
                 self.cache_order.retain(|old| old != &name);
+                self.credentials.retain(|_, pending| pending.sender != name);
             }
         }
         if message.msg_type() != MessageType::MethodCall {
@@ -326,7 +358,7 @@ impl BusIo {
                 .map(|member| member.to_string())
                 .unwrap_or_default(),
         ) {
-            self.forward(message, None, received);
+            self.forward(message, None, None, received);
             return Ok(());
         }
         let Some(sender) = message
@@ -341,12 +373,22 @@ impl BusIo {
             );
             return Ok(());
         };
-        if let Some(uid) = self.cache.get(&sender).copied() {
-            self.forward(message, Some(uid), received);
+        let creating = message.member().as_deref() == Some("CreateContext");
+        if let Some(uid) = self.cache.get(&sender).copied().filter(|_| !creating) {
+            self.forward(message, Some(uid), None, received);
         } else if self.credentials.len() < 128 {
-            let query = Message::new_method_call(BUS, BUS_PATH, BUS, "GetConnectionUnixUser")
-                .map_err(io::Error::other)?
-                .append1(&sender);
+            let query = Message::new_method_call(
+                BUS,
+                BUS_PATH,
+                BUS,
+                if creating {
+                    "GetConnectionCredentials"
+                } else {
+                    "GetConnectionUnixUser"
+                },
+            )
+            .map_err(io::Error::other)?
+            .append1(&sender);
             let serial = self
                 .channel
                 .send(query)
@@ -423,7 +465,7 @@ fn bounded_arguments(message: &Message) -> bool {
         match iter.arg_type() {
             ArgType::Invalid => return true,
             ArgType::String if iter.get::<&str>().is_some_and(|value| value.len() <= 256) => {}
-            ArgType::UnixFd | ArgType::UInt32 => {}
+            ArgType::UnixFd | ArgType::UInt32 | ArgType::UInt64 => {}
             _ => return false,
         }
         iter.next();

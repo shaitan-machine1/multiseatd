@@ -9,7 +9,7 @@ pub const OBJECT_PATH: &str = "/org/SGLogin/Multiseatd1";
 pub const INTERFACE_NAME: &str = "org.SGLogin.Multiseatd1.Manager";
 pub const INTROSPECTION: &str = include_str!("../dbus/org.SGLogin.Multiseatd1.Manager.xml");
 pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-pub const METHODS: [&str; 14] = [
+pub const METHODS: [&str; 15] = [
     "CreateContext",
     "ActivateContext",
     "DeactivateContext",
@@ -18,6 +18,7 @@ pub const METHODS: [&str; 14] = [
     "RemoveAclGrant",
     "CreateConnection",
     "GetContext",
+    "GetContextByMasterPid",
     "GetSeatMetadata",
     "RemoveContextById",
     "ListContexts",
@@ -119,6 +120,7 @@ pub enum ErrorKind {
     InvalidArgument,
     NotAuthorized,
     NotFound,
+    AmbiguousContext,
     NotReady,
     Busy,
     LimitExceeded,
@@ -130,10 +132,11 @@ pub enum ErrorKind {
     CriticalFailure,
 }
 impl ErrorKind {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::InvalidArgument,
         Self::NotAuthorized,
         Self::NotFound,
+        Self::AmbiguousContext,
         Self::NotReady,
         Self::Busy,
         Self::LimitExceeded,
@@ -149,6 +152,7 @@ impl ErrorKind {
             Self::InvalidArgument => "org.SGLogin.Multiseatd1.Error.InvalidArgument",
             Self::NotAuthorized => "org.SGLogin.Multiseatd1.Error.NotAuthorized",
             Self::NotFound => "org.SGLogin.Multiseatd1.Error.NotFound",
+            Self::AmbiguousContext => "org.SGLogin.Multiseatd1.Error.AmbiguousContext",
             Self::NotReady => "org.SGLogin.Multiseatd1.Error.NotReady",
             Self::Busy => "org.SGLogin.Multiseatd1.Error.Busy",
             Self::LimitExceeded => "org.SGLogin.Multiseatd1.Error.LimitExceeded",
@@ -175,7 +179,7 @@ mod tests {
     fn exact_common_surface_and_seven_field_record() {
         assert_eq!(ContextInfo::signature().to_string(), "(suauaubbb)");
         assert_eq!(Vec::<ContextInfo>::signature().to_string(), "a(suauaubbb)");
-        assert_eq!(INTROSPECTION.matches("<method name=").count(), 14);
+        assert_eq!(INTROSPECTION.matches("<method name=").count(), 15);
         for name in METHODS {
             assert!(INTROSPECTION.contains(&format!("name=\"{name}\"")));
         }
@@ -192,7 +196,7 @@ mod tests {
             assert!(!INTROSPECTION.contains(&format!("name=\"{removed}\"")));
         }
         assert!(INTROSPECTION.contains("name=\"vt\" type=\"u\" direction=\"in\""));
-        assert_eq!(ErrorKind::ALL.len(), 12);
+        assert_eq!(ErrorKind::ALL.len(), 13);
         for kind in ErrorKind::ALL {
             assert_eq!(ErrorKind::from_name(kind.name()), Some(kind));
         }

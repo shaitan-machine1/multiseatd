@@ -69,7 +69,13 @@ pub async fn dispatch(request: &Request, seat: &Seat) -> Result<Message> {
     match member.as_str() {
         "CreateContext" => {
             let (vt,): (u32,) = arguments(message)?;
-            let (authority, id) = seat.create_context(vt, budget).await?;
+            let master = request.master.clone().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotAuthorized,
+                    "authenticated ProcessFD is required",
+                )
+            })?;
+            let (authority, id) = seat.create_context_for_master(vt, master, budget).await?;
             Ok(message
                 .method_return()
                 .append2(wire_fd(authority), id.to_string()))
@@ -118,6 +124,12 @@ pub async fn dispatch(request: &Request, seat: &Seat) -> Result<Message> {
             let (authority,): (dbus::arg::OwnedFd,) = arguments(message)?;
             let (name, vt) = seat.seat_metadata(fd(authority).as_fd(), budget).await?;
             Ok(message.method_return().append2(name, vt))
+        }
+        "GetContextByMasterPid" => {
+            let (pid, start): (u32, u64) = arguments(message)?;
+            Ok(message
+                .method_return()
+                .append1(seat.get_context_by_master_pid(pid, start, budget).await?))
         }
         "ListContexts" => {
             arguments::<()>(message)?;

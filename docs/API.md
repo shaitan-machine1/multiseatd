@@ -21,6 +21,7 @@ Both builds expose exactly these methods:
 | RemoveAclGrant | `h authority, u uid` | — | capability |
 | CreateConnection | `h authority` | `h endpoint, u handle` | capability |
 | GetContext | `h authority` | `(suauaubbb)` | capability |
+| GetContextByMasterPid | `u pid, t start_time` | `(suauaubbb)` | public read-only |
 | GetSeatMetadata | `h authority` | `s seat, u vt` | capability |
 | RemoveContextById | `s id` | — | root |
 | ListContexts | — | `a(suauaubbb)` | root |
@@ -51,7 +52,15 @@ connection never removes/deactivates its context or closes a sibling. The SDK's
 local `remove_connection(BorrowedFd)` calls shutdown without closing the borrowed
 FD; ordinary duplicate drop does not shut down the endpoint.
 
-`StateChanged(t revision)` is a root-only invalidation hint; query current state.
+`StateChanged(t revision)` is a public broadcast invalidation hint; query current state.
+Exact-master lookup publicly exposes limited association metadata and coarse
+change timing, never authority. It returns NotFound for no live match and
+AmbiguousContext for multiple matches on this seat; it never chooses one.
+CreateContext requires root's authenticated bus ProcessFD (no numeric-PID
+acquisition fallback). Its immutable master is that exact process, identified by
+PID and /proc stat field-22 start time. Bus disconnect alone is not process exit.
+Both authority and master must remain alive; delegates do not extend master
+lifetime. Dead-master lookup is read-only and does not initiate cleanup.
 Clients pin a root-owned unique bus owner, disable autostart, and reject owner
 replacement. The synchronous SDK has explicit seat routing, borrowed/owned FD
 APIs and manually driven signal subscriptions, without background threads.
@@ -69,7 +78,7 @@ omitting it from configuration. Startup is not a live move.
 ## Errors and deadlines
 
 Prefix `org.SGLogin.Multiseatd1.Error.`:
-`InvalidArgument`, `NotAuthorized`, `NotFound`, `NotReady`, `Busy`,
+`InvalidArgument`, `NotAuthorized`, `NotFound`, `AmbiguousContext`, `NotReady`, `Busy`,
 `LimitExceeded`, `Pending`, `Stopping`, `DeviceRemovalFailed`,
 `DeviceAdditionFailed`, `VTActivationFailed`, `CriticalFailure`.
 

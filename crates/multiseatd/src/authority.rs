@@ -40,9 +40,15 @@ pub struct Registration {
     anchor: Arc<UnixStream>,
     alive: Arc<AtomicBool>,
     error: Arc<AtomicI32>,
+    pub master: Option<Arc<crate::master::Master>>,
 }
 impl Registration {
     pub fn is_alive(&self) -> io::Result<bool> {
+        if let Some(master) = &self.master
+            && !master.is_alive()?
+        {
+            return Ok(false);
+        }
         let error = self.error.load(Ordering::Acquire);
         if error != 0 {
             return Err(io::Error::from_raw_os_error(error));
@@ -151,6 +157,7 @@ impl Authorities {
                     anchor: Arc::new(anchor),
                     alive: Arc::new(AtomicBool::new(true)),
                     error: Arc::new(AtomicI32::new(0)),
+                    master: None,
                 },
             },
         );

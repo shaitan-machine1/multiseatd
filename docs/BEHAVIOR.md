@@ -15,6 +15,14 @@ Seat directly. Parent-retained operations survive reply expiry/adapter failure.
 No policy inbox, per-call spawning, Arc<Seat>, ACL actor or independent catalog
 lock exists.
 
+Context lifetime also requires its immutable authenticated CreateContext master.
+The daemon retains its bus-provided pidfd and observes exit with bounded
+parent-owned async watches. Every live/eligible check and broker/ACL permission
+checks the exact master's liveness even before queued exit delivery. Exit uses
+ordinary context removal and the same withdrawal barrier, without killing the
+master or session. Lookup independently checks liveness without initiating repair.
+Restart does not reconstruct contexts or adopt delegated authority.
+
 One helper derives the eligible foreground active context. Broker resources see
 an opaque revocable permission, never context/VT/ACL policy. Open admission lasts
 through cleanup/job registration; kernel work starts only after guard release.
